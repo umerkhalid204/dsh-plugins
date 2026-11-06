@@ -1,5 +1,5 @@
 # dsh-bionic-parity-all — the whole Bionic parity stack in one bundle layer.
-# Verified row-by-row during development in bionic-vs-dsh-gap-analysis.md / BUILDLOG.md of
+# Verified during development; evidence in docs/BUILDLOG.md and docs/bionic-vs-dsh-gap-analysis.md
 # github:umerkhalid204/dsh-bionic-parity. Registry deps (@deepseek-ai/*) install through npm;
 # this account's own plugin code ships vendored under ./packages (the harness blocks exotic
 # git sub-dependencies inside dependency trees by supply-chain policy).

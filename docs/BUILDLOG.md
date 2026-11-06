@@ -52,3 +52,7 @@ Status legend: ✅ live & verified · 🟡 live, verification limited (noted) ·
 ## Next in queue (from the gap plan)
 
 `dsh-skill-install` (G8) → `dsh-doc-work-project` (G6) → `dsh-model-hub` slices (G1) → `dsh-link` (G3).
+
+## 2026-11-06 (final): monorepo consolidation
+
+All four repos are now this single `dsh-plugins` repo (tag v1.0.0). Canonical install = the three-line block in root INSTALL.md, all `github:umerkhalid204/dsh-plugins#path:plugins/<name>&v1.0.0`. Re-verified live on the desktop profile: three installs applied with zero warnings, profile deps point at dsh-plugins, Documents route serves real data, career-ops skill re-enters the catalog from a path-fragment bundle (git path specs at profile root fully support bundle skills). Old repos (`dsh-bionic-parity`, `dsh-bionic-parity-all`, `dsh-career-ops`, `dsh-plugin-session-delete`) archived with their history; new work lands here.
