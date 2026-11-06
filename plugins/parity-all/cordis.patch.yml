@@ -1,6 +1,9 @@
-# dsh-bionic-parity-all — the whole Bionic parity stack in one bundle layer.
-# Part of the dsh-plugins monorepo (github:umerkhalid204/dsh-plugins); one-paste install# is at the repo root INSTALL.md. Capability packages come from npm registry dependencies;# this account's own plugin code ships vendored under ./packages subpath rows. Git specs# are allowed at the profile root (career-ops, session-delete) but not as subdependencies# (harness supply-chain policy: ERR_PNPM_EXOTIC_SUBDEP).
-
+# dsh-bionic-parity-all - the whole Bionic parity stack in one bundle layer.
+# Part of the dsh-plugins monorepo (github:umerkhalid204/dsh-plugins). One-paste install
+# is at the repo root INSTALL.md. Capability packages come from npm registry dependencies;
+# this account's own plugin code ships vendored under ./packages subpath rows. Git specs
+# are allowed at the profile root (career-ops, session-delete) but not as subdependencies
+# (harness supply-chain policy: ERR_PNPM_EXOTIC_SUBDEP).
 
 - insert:
     - id: bionic-voice-stt
