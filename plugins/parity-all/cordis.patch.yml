@@ -1,12 +1,7 @@
 # dsh-bionic-parity-all — the whole Bionic parity stack in one bundle layer.
-# Verified during development; evidence in docs/BUILDLOG.md and docs/bionic-vs-dsh-gap-analysis.md
-# github:umerkhalid204/dsh-bionic-parity. Registry deps (@deepseek-ai/*) install through npm;
-# this account's own plugin code ships vendored under ./packages (the harness blocks exotic
-# git sub-dependencies inside dependency trees by supply-chain policy).
-# For dsh-career-ops and dsh-plugin-session-delete install the two root-level github: specs
-# listed in INSTALL.md (root github: deps are allowed; subdependency git refs are not).
+# Part of the dsh-plugins monorepo (github:umerkhalid204/dsh-plugins); one-paste install# is at the repo root INSTALL.md. Capability packages come from npm registry dependencies;# this account's own plugin code ships vendored under ./packages subpath rows. Git specs# are allowed at the profile root (career-ops, session-delete) but not as subdependencies# (harness supply-chain policy: ERR_PNPM_EXOTIC_SUBDEP).
 
-# ---- 1. Voice input: local offline transcription (SenseVoiceSmall ONNX + Silero VAD) ----
+
 - insert:
     - id: bionic-voice-stt
       name: '@deepseek-ai/dsh-experimental-speech-to-text'
