@@ -19,6 +19,6 @@ Paste the block from [INSTALL.md](INSTALL.md) into the target computer's DSH age
 
 ## Provenance
 
-This repo supersedes `dsh-bionic-parity`, `dsh-bionic-parity-all`, `dsh-career-ops`, and `dsh-plugin-session-delete` (archived with their history; new work happens here). Versions: tag `v1.1.0` = parity-all 1.0.2 (cloud-only bridge rows) + local-llm 0.3.0 (merged; schemastery aligned to the 3.19 host realm) + career-ops 1.0.4 + session-delete 1.0.2.
+This repo supersedes `dsh-bionic-parity`, `dsh-bionic-parity-all`, `dsh-career-ops`, and `dsh-plugin-session-delete` (archived with their history; new work happens here). Versions: tag `v1.1.0` = parity-all 1.0.2 (package.json), cloud-only bridge rows + local-llm 0.3.0 (merged; schemastery aligned to the 3.19 host realm) + career-ops 1.0.4 + session-delete 1.0.2.
 
 MIT licensed (vendored third-party packages keep their own licenses).

@@ -4,10 +4,10 @@ Open any chat in that computer's DeepSeek Harness (Desktop or Web) and send exac
 
 ```
 Install four bundles with plugin_manager (action install_bundle), one per line, in order, then report each application stage and any warnings:
-1. target: github:umerkhalid204/dsh-plugins#path:plugins/parity-all&v1.1.0
-2. target: github:umerkhalid204/dsh-plugins#path:plugins/local-llm&v1.1.0
-3. target: github:umerkhalid204/dsh-plugins#path:plugins/career-ops&v1.1.0
-4. target: github:umerkhalid204/dsh-plugins#path:plugins/session-delete&v1.1.0
+1. target: github:umerkhalid204/dsh-plugins#path:plugins/parity-all&v1.1.1
+2. target: github:umerkhalid204/dsh-plugins#path:plugins/local-llm&v1.1.1
+3. target: github:umerkhalid204/dsh-plugins#path:plugins/career-ops&v1.1.1
+4. target: github:umerkhalid204/dsh-plugins#path:plugins/session-delete&v1.1.1
 ```
 
 Line 1 installs the full Bionic-parity stack (voice, the `openrouter-cloud` route + `openrouter_bridge_status` diagnostics, Computer Use, browser control, skills install + external skill roots, Document preset, Documents page). Line 2 adds the **local-llm** engine layer: LM Studio (MLX), Ollama, Lemonade and generic OpenAI-compatible engines as first-class provider routes with Settings-models cards, endpoint editing, model discovery, catalog enrichment, and the `local_models scan/use/ping/settings` tool. Lines 3–4 add career-ops and session-delete. All live in this repo as path fragments.

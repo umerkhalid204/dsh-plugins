@@ -1,6 +1,6 @@
 {
   "name": "dsh-bionic-parity-all",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "description": "One bundle that installs the full LM Studio Bionic parity stack into any DeepSeek Harness profile: voice input, local/cloud open models, computer + browser control, skills install, and document projects.",
   "type": "module",
