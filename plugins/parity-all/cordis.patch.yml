@@ -25,41 +25,9 @@
 
 # ---- 2. Open-model providers: local MLX / Ollama / cloud via the bridge adapter ----
 - insert:
-    - id: bionic-bridge
-      name: './packages/bridge/index.js'
-      config:
-        providerName: bionic-mlx
-        displayName: Bionic / LM Studio (MLX, local)
-        baseURL: http://127.0.0.1:1234/v1
-        apiKey: lm-studio
-        defaultContextWindow: 262144
-        defaultMaxTokens: 16384
-        models:
-          - id: lmstudio-community/Qwen3.8-27B-MLX-6bit
-            name: Qwen3.8-27B MLX 6-bit
-            contextWindow: 262144
-            maxTokens: 16384
-            input: [text, image]
-          - id: lmstudio-community/orcarouter/Qwen3.8-27B-Uncensored-MLX
-            name: Qwen3.8-27B Uncensored MLX
-            contextWindow: 262144
-            maxTokens: 16384
-            input: [text, image]
-          - id: lmstudio-community/orcarouter/Qwen3.8-27B-Uncensored-MLX/2-bit
-            name: Qwen3.8-27B Uncensored MLX 2-bit
-            contextWindow: 262144
-            maxTokens: 16384
-            input: [text, image]
-    - id: bionic-bridge-ollama
-      name: './packages/bridge/index.js'
-      config:
-        providerName: ollama-local
-        displayName: Ollama (local)
-        statusToolName: ollama_bridge_status
-        baseURL: http://127.0.0.1:11434/v1
-        apiKey: ollama
-        defaultContextWindow: 128000
-        defaultMaxTokens: 8192
+    # Local engines (LM Studio/MLX, Ollama, Lemonade) are owned by the local-llm
+    # bundle's routes — richer catalogs, Settings cards, discovery, local_models
+    # tooling. This bundle keeps only the cloud route here.
     - id: bionic-bridge-openrouter
       name: './packages/bridge/index.js'
       config:

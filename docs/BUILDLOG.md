@@ -56,3 +56,8 @@ Status legend: ✅ live & verified · 🟡 live, verification limited (noted) ·
 ## 2026-11-06 (final): monorepo consolidation
 
 All four repos are now this single `dsh-plugins` repo (tag v1.0.0). Canonical install = the three-line block in root INSTALL.md, all `github:umerkhalid204/dsh-plugins#path:plugins/<name>&v1.0.0`. Re-verified live on the desktop profile: three installs applied with zero warnings, profile deps point at dsh-plugins, Documents route serves real data, career-ops skill re-enters the catalog from a path-fragment bundle (git path specs at profile root fully support bundle skills). Old repos (`dsh-bionic-parity`, `dsh-bionic-parity-all`, `dsh-career-ops`, `dsh-plugin-session-delete`) archived with their history; new work lands here.
+
+## 2026-11-06 (merge): dsh-plugin-local-llm -> plugins/local-llm
+
+The October standalone plugin was NOT redundant - it owns seam integration the bridge never did (configurable-provider directory cards with endpoint editing, model discovery, per-vendor catalog enrichment, `local_models scan/use/ping`, offline test suite). It WAS stale: its `strata` route is now owned by the pi-ai adapter on this profile, and it lacked this account's model declarations.
+Merge actions: copied into the monorepo; schemastery dep 3.18.5 -> 3.19.0 (host realm); `strata` disabled with a comment; curated MLX model fallbacks added under `lmstudio.models`; parity-all dropped its `bionic-mlx`/`ollama-local` rows (superseded) keeping `openrouter-cloud`. Their offline suite: 32/32 PASS on the merged copy against the fake-engine servers. Old repo deleted after this section is pushed.
