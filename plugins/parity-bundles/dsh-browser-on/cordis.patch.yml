@@ -1,0 +1,13 @@
+# Browser use: shared seam + Playwright-MCP provider, vendored beside this patch
+# (local link-bundles do not install npm deps through the profile pnpm tree).
+# Browser state is per live Session and initializes at Session creation/resume; existing sessions are not retrofitted.
+# headless: false opens a visible Chrome window like Bionic's browser; set true for background automation.
+- insert:
+    - id: bionic-browser-use
+      name: './vendor/node_modules/@deepseek-ai/dsh-browser-use/lib/index.js'
+    - id: bionic-browser-playwright
+      name: './vendor/node_modules/@deepseek-ai/dsh-experimental-browser-use-playwright-mcp/lib/index.js'
+      config:
+        mode: launch
+        headless: false
+        executablePath: /Applications/Google Chrome.app/Contents/MacOS/Google Chrome

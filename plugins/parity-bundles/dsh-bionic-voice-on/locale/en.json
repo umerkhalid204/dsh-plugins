@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Bionic Voice (local speech input)",
+    "description": "Enables offline voice input: record in the composer, transcribed locally on this machine by SenseVoiceSmall (no cloud, no Python). The model downloads once from Hugging Face on first setup."
+  }
+}

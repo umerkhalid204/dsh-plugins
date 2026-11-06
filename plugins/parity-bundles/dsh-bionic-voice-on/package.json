@@ -1,0 +1,21 @@
+{
+  "name": "dsh-bionic-voice-on",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Enablement bundle: offline local voice input (SenseVoiceSmall ONNX) in the Harness composer, Bionic-style.",
+  "type": "module",
+  "exports": {
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

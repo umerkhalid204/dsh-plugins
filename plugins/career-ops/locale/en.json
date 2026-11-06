@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "career-ops",
+    "description": "The open-source AI job-search agent, running in Harness: paste a posting to get an A-H evaluation with a 1-5 fit score, scan public ATS boards, tailor CVs and cover letters, and follow the whole pipeline in a Career Ops panel. Your data stays in your own folder."
+  }
+}

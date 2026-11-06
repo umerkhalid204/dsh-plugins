@@ -1,0 +1,22 @@
+{
+  "name": "dsh-browser-on",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Enablement bundle: per-session Chromium browser control via Playwright MCP (Bionic-style web automation).",
+  "type": "module",
+  "exports": {
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "vendor/**"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

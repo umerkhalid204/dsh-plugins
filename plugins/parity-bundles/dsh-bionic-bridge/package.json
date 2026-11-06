@@ -1,0 +1,24 @@
+{
+  "name": "dsh-bionic-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LLM adapter for the local Bionic / LM Studio OpenAI-compatible server (MLX), with live model catalog and self-test tool.",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

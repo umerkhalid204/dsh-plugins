@@ -1,0 +1,18 @@
+# Enable local voice input: speech service + SenseVoice local provider + speech Remote + composer mic.
+- insert:
+    - id: bionic-voice-stt
+      name: '@deepseek-ai/dsh-experimental-speech-to-text'
+      config:
+        defaultProvider: sensevoice-local
+        language: auto
+    - id: bionic-voice-sensevoice
+      name: '@deepseek-ai/dsh-experimental-speech-to-text-sensevoice'
+      config:
+        dataRoot: !!js dshHomePath('speech')
+    - id: bionic-voice-api
+      name: '@deepseek-ai/dsh-experimental-api-speech-to-text'
+      config:
+        maxAudioBytes: 4194304
+        maxDurationSeconds: 180
+    - id: bionic-voice-ui
+      name: '@deepseek-ai/dsh-experimental-client-ui-voice-input'

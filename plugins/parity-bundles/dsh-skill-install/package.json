@@ -1,0 +1,24 @@
+{
+  "name": "dsh-skill-install",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Install SKILL.md skills from a URL into the Harness skill roots, and surface Bionic/Codex/Claude skill folders.",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

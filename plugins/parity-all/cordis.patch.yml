@@ -1,0 +1,273 @@
+# dsh-bionic-parity-all — the whole Bionic parity stack in one bundle layer.
+# Verified row-by-row during development in bionic-vs-dsh-gap-analysis.md / BUILDLOG.md of
+# github:umerkhalid204/dsh-bionic-parity. Registry deps (@deepseek-ai/*) install through npm;
+# this account's own plugin code ships vendored under ./packages (the harness blocks exotic
+# git sub-dependencies inside dependency trees by supply-chain policy).
+# For dsh-career-ops and dsh-plugin-session-delete install the two root-level github: specs
+# listed in INSTALL.md (root github: deps are allowed; subdependency git refs are not).
+
+# ---- 1. Voice input: local offline transcription (SenseVoiceSmall ONNX + Silero VAD) ----
+- insert:
+    - id: bionic-voice-stt
+      name: '@deepseek-ai/dsh-experimental-speech-to-text'
+      config:
+        defaultProvider: sensevoice-local
+        language: auto
+    - id: bionic-voice-sensevoice
+      name: '@deepseek-ai/dsh-experimental-speech-to-text-sensevoice'
+      config:
+        dataRoot: !!js dshHomePath('speech')
+    - id: bionic-voice-api
+      name: '@deepseek-ai/dsh-experimental-api-speech-to-text'
+      config:
+        maxAudioBytes: 4194304
+        maxDurationSeconds: 180
+    - id: bionic-voice-ui
+      name: '@deepseek-ai/dsh-experimental-client-ui-voice-input'
+
+# ---- 2. Open-model providers: local MLX / Ollama / cloud via the bridge adapter ----
+- insert:
+    - id: bionic-bridge
+      name: './packages/bridge/index.js'
+      config:
+        providerName: bionic-mlx
+        displayName: Bionic / LM Studio (MLX, local)
+        baseURL: http://127.0.0.1:1234/v1
+        apiKey: lm-studio
+        defaultContextWindow: 262144
+        defaultMaxTokens: 16384
+        models:
+          - id: lmstudio-community/Qwen3.8-27B-MLX-6bit
+            name: Qwen3.8-27B MLX 6-bit
+            contextWindow: 262144
+            maxTokens: 16384
+            input: [text, image]
+          - id: lmstudio-community/orcarouter/Qwen3.8-27B-Uncensored-MLX
+            name: Qwen3.8-27B Uncensored MLX
+            contextWindow: 262144
+            maxTokens: 16384
+            input: [text, image]
+          - id: lmstudio-community/orcarouter/Qwen3.8-27B-Uncensored-MLX/2-bit
+            name: Qwen3.8-27B Uncensored MLX 2-bit
+            contextWindow: 262144
+            maxTokens: 16384
+            input: [text, image]
+    - id: bionic-bridge-ollama
+      name: './packages/bridge/index.js'
+      config:
+        providerName: ollama-local
+        displayName: Ollama (local)
+        statusToolName: ollama_bridge_status
+        baseURL: http://127.0.0.1:11434/v1
+        apiKey: ollama
+        defaultContextWindow: 128000
+        defaultMaxTokens: 8192
+    - id: bionic-bridge-openrouter
+      name: './packages/bridge/index.js'
+      config:
+        providerName: openrouter-cloud
+        displayName: OpenRouter cloud open models
+        statusToolName: openrouter_bridge_status
+        baseURL: https://openrouter.ai/api/v1
+        apiKeyRef: OPENROUTER_API_KEY
+        liveCatalogLimit: 25
+        defaultContextWindow: 131072
+        defaultMaxTokens: 8192
+        models:
+          - id: z-ai/glm-5.3
+            name: GLM 5.3
+            input: [text]
+          - id: moonshotai/kimi-k3
+            name: Kimi K3
+            input: [text, image]
+          - id: deepseek/deepseek-v4-pro
+            name: DeepSeek V4 Pro
+            input: [text]
+          - id: qwen/qwen3.8-max-prime
+            name: Qwen3.8 Max Prime
+            input: [text, image]
+
+# ---- 3. Computer control (macOS native helper) + permission UI, registered globally ----
+- insert:
+    - id: cua-provider-registry
+      name: '@deepseek-ai/dsh-computer-use'
+    - id: cua
+      name: '@deepseek-ai/dsh-experimental-cua-macos'
+      disabled: !!js process.platform !== 'darwin'
+      config:
+        agentPreset: false
+    - id: ui-cua
+      name: '@deepseek-ai/dsh-cua'
+
+# ---- 4. Browser control: per-session Chromium through Playwright MCP ----
+- insert:
+    - id: bionic-browser-use
+      name: '@deepseek-ai/dsh-browser-use'
+    - id: bionic-browser-playwright
+      name: '@deepseek-ai/dsh-experimental-browser-use-playwright-mcp'
+      config:
+        mode: launch
+        headless: false
+        executablePath: !!js ({darwin:'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',win32:'C:/Program Files/Google/Chrome/Application/chrome.exe',linux:'/usr/bin/google-chrome'})[process.platform]
+
+# ---- 5. Skills: install from URL + external skill roots (Bionic, Codex, Claude Code) ----
+- insert:
+    - id: bionic-skill-tool
+      name: './packages/skill-install/index.js'
+      config:
+        installDir: !!js dshHomePath('skills')
+    - id: bionic-skill-external
+      name: '@deepseek-ai/dsh-skill-filesystem'
+      config:
+        providerName: external-apps
+        includeDefaultRoots: false
+        dshHome: !!js dshHomePath('.')
+        agentsHome: !!js dshHomePath('.')
+        watch: true
+        customSkillDirs:
+          - !!js (process.env.HOME || process.env.USERPROFILE || '~') + '/.lmstudio/skills'
+          - !!js (process.env.HOME || process.env.USERPROFILE || '~') + '/.lmstudio/hub/skills'
+          - !!js (process.env.HOME || process.env.USERPROFILE || '~') + '/.codex/skills'
+          - !!js (process.env.HOME || process.env.USERPROFILE || '~') + '/.claude/skills'
+
+# ---- 6. Work projects: Document preset + Documents hub page ----
+- insert:
+    - id: preset-document
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: document
+        name: Document project
+        description: Creates and revises documents, decks, and spreadsheets as workspace files.
+        order: 5
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |
+                You are a document work agent powered by the {{model}} model.
+                You create and revise professional deliverables — reports, memos, decks, spreadsheets, PDFs — as real files in the workspace.
+                Keep one canonical file per deliverable and edit it in place across turns; carry the user's audience, length, tone, and output format from their request, and ask only when one of those is genuinely missing.
+                For .docx, .pptx, .xlsx, and PDF work, load the office skills first and follow them; convert documents to PDF through the office export workflow rather than ad-hoc tools.
+                Cite source material you were given, keep claims traceable to it, and prefer tables and structure over prose walls for comparisons.
+                Finish document work by presenting the changed files so the user can open them directly.
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              applyPatch: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: tool-schedule
+            name: '@deepseek-ai/dsh-tool-schedule'
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: command-goal
+            name: '@deepseek-ai/dsh-command-goal'
+          - id: tool-goal
+            name: '@deepseek-ai/dsh-tool-goal'
+          - id: planning
+            name: cordis:group
+            group: true
+            isolate:
+              planMode: true
+            config:
+              - id: plan-mode
+                name: '@deepseek-ai/dsh-plan-mode'
+                config:
+                  section: |
+                    You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+                    Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
+
+                    The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed to keep the tool catalog unchanged. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+
+                    Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
+
+                    Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
+
+                    When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          - id: delegation
+            name: cordis:group
+            group: true
+            isolate:
+              workflowEngine: true
+            config:
+              - id: tool-subagent-control
+                name: '@deepseek-ai/dsh-tool-subagent-control'
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  modelSelection: true
+                  modelDiscovery: true
+              - id: tool-subagent-fork
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: fork
+                  toolName: subagent_fork
+              - id: workflow-ptc
+                name: '@deepseek-ai/dsh-workflow-ptc'
+                config:
+                  provider: spawn
+              - id: tool-workflow
+                name: '@deepseek-ai/dsh-tool-workflow'
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'
+          - id: tool-plugin-manager
+            name: '@deepseek-ai/dsh-plugin-manager/tools'
+            disabled: !!js "!ctx.get('profileContext')"
+          - id: tool-plugin-market
+            name: '@deepseek-ai/dsh-plugin-market/tools'
+            disabled: true
+# ---- 6b. Documents hub page: Host routes (subpath plugin) + Client page (umbrella package row) ----
+- insert:
+    - id: bionic-docs-ui
+      name: './packages/doc-ui/index.js'
+    - id: bionic-parity-all-client
+      name: dsh-bionic-parity-all

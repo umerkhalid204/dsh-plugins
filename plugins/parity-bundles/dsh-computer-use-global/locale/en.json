@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Computer Use global",
+    "description": "Registers the macOS computer-use tool for all agent presets instead of only the code-first preset."
+  }
+}

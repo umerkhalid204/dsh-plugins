@@ -1,0 +1,23 @@
+# Installed/generated artifacts
+node_modules/
+pnpm-lock.yaml
+*.log
+.DS_Store
+.cache/
+.runtime-cache/
+
+# career-ops data-root marker (per machine, never committed)
+.career-ops-data
+
+# A data root accidentally pointed at the package root itself (anchored to the
+# package root so nothing under runtime/ is ever ignored)
+/data/
+/reports/
+/output/
+/jds/
+/documents/
+/interview-prep/
+/cv.md
+/portals.yml
+/article-digest.md
+/config/profile.yml

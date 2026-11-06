@@ -1,0 +1,21 @@
+- insert:
+    # install_skill / remove_skill tool; writes into the user skill root of this profile's DSH home.
+    - id: bionic-skill-tool
+      name: dsh-skill-install
+      config:
+        installDir: !!js dshHomePath('skills')
+    # Second filesystem-skill provider instance that exposes external apps' skill folders
+    # (Bionic/LM Studio, Codex, Claude Code) without touching the preset-owned primary row.
+    - id: bionic-skill-external
+      name: '@deepseek-ai/dsh-skill-filesystem'
+      config:
+        providerName: external-apps
+        includeDefaultRoots: false
+        dshHome: !!js dshHomePath('.')
+        agentsHome: !!js dshHomePath('.')
+        watch: true
+        customSkillDirs:
+          - !!js (process.env.HOME || process.env.USERPROFILE || '~') + '/.lmstudio/skills'
+          - !!js (process.env.HOME || process.env.USERPROFILE || '~') + '/.lmstudio/hub/skills'
+          - !!js (process.env.HOME || process.env.USERPROFILE || '~') + '/.codex/skills'
+          - !!js (process.env.HOME || process.env.USERPROFILE || '~') + '/.claude/skills'

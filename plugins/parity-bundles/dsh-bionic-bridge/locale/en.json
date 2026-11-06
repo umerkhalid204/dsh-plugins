@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Bionic bridge (local MLX models)",
+    "description": "Runs the agent on models served by the local Bionic / LM Studio server. The model picker lists what the server currently serves, and bionic_bridge_status probes the endpoint end to end."
+  }
+}

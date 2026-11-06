@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Browser control (Playwright)",
+    "description": "Gives each session its own Chromium (Chrome) browser: navigate, click, type, screenshot, and read pages through Playwright MCP tools."
+  }
+}

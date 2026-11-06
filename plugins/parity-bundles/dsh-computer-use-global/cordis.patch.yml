@@ -1,0 +1,6 @@
+# Override the official cua-bundle row: register the cua tool and guidance globally.
+# Config is replaced wholesale, so only intentional fields are restated; every other field keeps its schema default.
+- id: cua
+  name: '@deepseek-ai/dsh-experimental-cua-macos'
+  config:
+    agentPreset: false

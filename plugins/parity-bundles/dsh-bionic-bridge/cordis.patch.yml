@@ -1,0 +1,66 @@
+- insert:
+    - id: bionic-bridge
+      name: dsh-bionic-bridge
+      config:
+        providerName: bionic-mlx
+        displayName: Bionic / LM Studio (MLX, local)
+        baseURL: http://127.0.0.1:1234/v1
+        apiKey: lm-studio
+        defaultContextWindow: 262144
+        defaultMaxTokens: 16384
+        models:
+          - id: lmstudio-community/Qwen3.8-27B-MLX-6bit
+            name: Qwen3.8-27B MLX 6-bit
+            contextWindow: 262144
+            maxTokens: 16384
+            input: [text, image]
+          - id: lmstudio-community/orcarouter/Qwen3.8-27B-Uncensored-MLX
+            name: Qwen3.8-27B Uncensored MLX
+            contextWindow: 262144
+            maxTokens: 16384
+            input: [text, image]
+          - id: lmstudio-community/orcarouter/Qwen3.8-27B-Uncensored-MLX/2-bit
+            name: Qwen3.8-27B Uncensored MLX 2-bit
+            contextWindow: 262144
+            maxTokens: 16384
+            input: [text, image]
+    # Second instance: Ollama endpoint parity (catalog comes live from /v1/models;
+    # empty while Ollama is not running). Uses its own status tool name to avoid
+    # a duplicate tool registration.
+    - id: bionic-bridge-ollama
+      name: dsh-bionic-bridge
+      config:
+        providerName: ollama-local
+        displayName: Ollama (local)
+        statusToolName: ollama_bridge_status
+        baseURL: http://127.0.0.1:11434/v1
+        apiKey: ollama
+        defaultContextWindow: 128000
+        defaultMaxTokens: 8192
+    # Third instance: cloud open-model frontier via OpenRouter (Bionic Secure-Cloud analogue).
+    # Catalog discovery is public; inference reads the credential named by apiKeyRef
+    # (set it on the Models page or in the harness credentials store — never inline keys).
+    - id: bionic-bridge-openrouter
+      name: dsh-bionic-bridge
+      config:
+        providerName: openrouter-cloud
+        displayName: OpenRouter cloud open models
+        statusToolName: openrouter_bridge_status
+        baseURL: https://openrouter.ai/api/v1
+        apiKeyRef: OPENROUTER_API_KEY
+        liveCatalogLimit: 25
+        defaultContextWindow: 131072
+        defaultMaxTokens: 8192
+        models:
+          - id: z-ai/glm-5.3
+            name: GLM 5.3
+            input: [text]
+          - id: moonshotai/kimi-k3
+            name: Kimi K3
+            input: [text, image]
+          - id: deepseek/deepseek-v4-pro
+            name: DeepSeek V4 Pro
+            input: [text]
+          - id: qwen/qwen3.8-max-prime
+            name: Qwen3.8 Max Prime
+            input: [text, image]

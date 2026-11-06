@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Skill install (URL + other apps)",
+    "description": "Installs SKILL.md skills from a URL into this profile, and lists skills you already keep for Bionic/LM Studio, Codex, and Claude Code."
+  }
+}

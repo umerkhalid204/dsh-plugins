@@ -1,0 +1,54 @@
+{
+  "name": "dsh-career-ops",
+  "version": "1.0.4",
+  "description": "career-ops job-search agent as a DeepSeek Harness plugin: evaluate postings into A-H reports with a 1-5 fit score, scan public ATS boards, tailor CVs and cover letters, and follow the whole pipeline in a Career Ops panel.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": ["dsh-plugin", "dsh-bundle", "cordis", "career-ops", "job-search", "recruiting"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/umerkhalid204/dsh-career-ops.git"
+  },
+  "bugs": {
+    "url": "https://github.com/umerkhalid204/dsh-career-ops/issues"
+  },
+  "homepage": "https://github.com/umerkhalid204/dsh-career-ops#readme",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./skill/career-ops.md": "./skill/career-ops.md",
+    "./runtime/*": "./runtime/*",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "skill/*.md",
+    "locale/*.json",
+    "icon.svg",
+    "runtime/**",
+    "scripts/*",
+    "README.md",
+    "CHANGELOG.md",
+    "THIRD-PARTY-NOTICES.md",
+    "LICENSE",
+    "LICENSE.career-ops"
+  ],
+  "dependencies": {
+    "dotenv": "^18.0.9",
+    "js-yaml": "^4.3.2"
+  },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-ui-layout"]
+    }
+  }
+}

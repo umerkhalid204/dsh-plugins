@@ -1,0 +1,53 @@
+{
+  "name": "dsh-bionic-parity-all",
+  "version": "1.0.1",
+  "private": true,
+  "description": "One bundle that installs the full LM Studio Bionic parity stack into any DeepSeek Harness profile: voice input, local/cloud open models, computer + browser control, skills install, and document projects.",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./packages/bridge/index.js": "./packages/bridge/index.js",
+    "./packages/bridge/locale/*.json": "./packages/bridge/locale/*.json",
+    "./packages/bridge/icon": "./packages/bridge/icon.svg",
+    "./packages/skill-install/index.js": "./packages/skill-install/index.js",
+    "./packages/skill-install/locale/*.json": "./packages/skill-install/locale/*.json",
+    "./packages/skill-install/icon": "./packages/skill-install/icon.svg",
+    "./packages/doc-ui/index.js": "./packages/doc-ui/index.js",
+    "./packages/doc-ui/locale/*.json": "./packages/doc-ui/locale/*.json",
+    "./packages/doc-ui/icon": "./packages/doc-ui/icon.svg",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "packages/**",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "INSTALL.md"
+  ],
+  "dependencies": {
+    "@deepseek-ai/dsh-computer-use": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-cua": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-experimental-cua-macos": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-browser-use": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-experimental-speech-to-text": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-experimental-speech-to-text-sensevoice": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-experimental-api-speech-to-text": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-experimental-client-ui-voice-input": "0.2.2-rc.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}

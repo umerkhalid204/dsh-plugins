@@ -1,0 +1,19 @@
+# dsh-career-ops bundle layer: inserts the career-ops plugin row.
+#
+# `dataRoot` is where YOUR career-ops data lives: cv.md, config/profile.yml,
+# portals.yml, data/, reports/, jds/, interview-prep/, and the personalization
+# files modes/_profile.md / _custom.md / _brief.md. It is deliberately empty here
+# so the same published package works on every machine:
+#
+#   1. this value, when set (absolute path, or `~/…`) — override it per machine in
+#      Settings → Plugins → career-ops → Configure, or in your own profile patch;
+#   2. $CAREER_OPS_DATA_DIR / $CAREER_OPS_ROOT from the Harness process environment;
+#   3. ~/career-ops, created on the first write.
+#
+# The career-ops System Layer (modes/*.md, providers/, templates/, scripts) ships
+# inside this package under runtime/ and is never written to.
+- insert:
+    - id: career-ops
+      name: 'dsh-career-ops'
+      config:
+        dataRoot: ''
