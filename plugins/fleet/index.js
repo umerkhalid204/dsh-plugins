@@ -202,6 +202,9 @@ function buildConfig(S) {
     benchTtlHours: S.natural(),
     fallbackTokPerSec: S.natural(),
     fallbackContextWindow: S.natural(),
+    // Only set this if you want the planner to price contention on the box that
+    // also runs this agent (e.g. 70 = assume 70% of its measured speed).
+    selfContentionPercent: S.natural(),
   })
   // Volatile: a save updates the registry in place instead of remounting the
   // row, so the Hosts this plugin owns are never torn down by an edit.
@@ -1518,6 +1521,7 @@ export function apply(ctx, config = {}) {
       ['/fleet/api/run', 'POST', (body) => orchestrator.run(body)],
       ['/fleet/api/runs', 'GET', async () => orchestrator.runs()],
       ['/fleet/api/run-view', 'POST', (body) => orchestrator.runView(body)],
+      ['/fleet/api/balance', 'POST', (body) => orchestrator.rebalance(body.chunks ?? [], body.taskClass)],
     ]
     for (const [path, method, handler] of routes) {
       ctx.effect(
@@ -1612,6 +1616,8 @@ export function apply(ctx, config = {}) {
         return orchestrator.runs()
       case 'run-view':
         return orchestrator.runView(params)
+      case 'balance':
+        return orchestrator.rebalance(params.chunks ?? [], params.taskClass)
       default:
         return { ok: false, error: `Unknown action "${params.action}".` }
     }
@@ -1636,7 +1642,7 @@ export function apply(ctx, config = {}) {
           properties: {
             action: {
               type: 'string',
-              enum: ['list', 'save', 'delete', 'action', 'logs', 'probe', 'open-url', 'install-runtime', 'engines', 'bench', 'plan', 'run', 'runs', 'run-view'],
+              enum: ['list', 'save', 'delete', 'action', 'logs', 'probe', 'open-url', 'install-runtime', 'engines', 'bench', 'plan', 'balance', 'run', 'runs', 'run-view'],
             },
             id: { type: 'string', description: 'instance id (slug) for action, logs, open-url; row id for delete' },
             op: { type: 'string', enum: ['provision', 'start', 'stop', 'restart', 'probe-instance', 'forget'], description: 'for action=action' },

@@ -1,3 +1,5 @@
+import { homedir } from 'node:os'
+
 /*
  * Fleet orchestration (R1: direct engine fan-out).
  *
@@ -19,6 +21,7 @@ const DEFAULTS = {
   contextFill: 0.6,
   fallbackContextWindow: 8192,
   fallbackTokPerSec: 15,
+  fallbackPrefillTokPerSec: 400,
   perEngineConcurrency: 1,
   chunkWallClockMs: 240000,
   chunkOutputTokens: 800,
@@ -91,6 +94,7 @@ export function createOrchestrator(deps) {
 
   const { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } = deps.fs
   const dirName = deps.path?.dirname ?? ((file) => String(file).split('/').slice(0, -1).join('/'))
+  const joinPath = deps.path?.join ?? ((...parts) => parts.filter(Boolean).join('/').replace(/\/+/gu, '/'))
 
   function load(file, fallback) {
     try {
@@ -131,14 +135,17 @@ export function createOrchestrator(deps) {
   /** Capability fingerprint for every engine, merged with any measured numbers. */
   async function engines() {
     const cache = benchCache()
+    const self = hostRoute()
     const rows = []
     for (const provider of providersByName().values()) {
       const key = await keyFor(provider)
+      const authority = authorityOfUrl(provider.baseURL)
+      const sharedWithHost = Boolean(self?.authority) && authorityMatch(self.authority, authority)
       for (const model of provider.models ?? []) {
         const stamp = cache.rows[`${provider.name}::${model.id}`]
         rows.push({
           engine: provider.name,
-          host: authorityOfUrl(provider.baseURL),
+          host: authority,
           api: provider.api,
           model: model.id,
           label: model.name ?? model.id,
@@ -146,14 +153,23 @@ export function createOrchestrator(deps) {
           maxTokens: model.maxTokens ?? null,
           reasoningEfforts: model.reasoningEfforts ?? null,
           hasKey: Boolean(key),
-          local: isLocalAuthority(authorityOfUrl(provider.baseURL)),
+          local: isLocalAuthority(authority),
+          sharedWithHost,
+          isThisAgent: sharedWithHost && String(self?.model) === String(model.id),
           measured: stamp
-            ? { tokPerSec: stamp.tokPerSec, ttftMs: stamp.ttftMs ?? null, at: stamp.at, scores: stamp.scores ?? {}, probeTokens: stamp.probeTokens ?? null }
+            ? { tokPerSec: stamp.tokPerSec, decodeTokPerSec: stamp.decodeTokPerSec ?? null, prefillTokPerSec: stamp.prefillTokPerSec ?? null, ttftMs: stamp.ttftMs ?? null, at: stamp.at, scores: stamp.scores ?? {}, probeTokens: stamp.probeTokens ?? null }
             : null,
         })
       }
     }
-    return { ok: true, engines: rows, cacheAgeHours: ageHours(rows.filter((r) => r.measured).map((r) => r.measured.at), now()), limits: opt }
+    return {
+      ok: true,
+      engines: rows,
+      self: self?.found ? { provider: self.provider, model: self.model, host: self.authority, note: self.note } : null,
+      selfProbe: self?.found ? undefined : { error: 'no agent-default-model entry readable from the profile patch', tried: self?.tried },
+      cacheAgeHours: ageHours(rows.filter((r) => r.measured).map((r) => r.measured.at), now()),
+      limits: opt,
+    }
   }
 
   /* ------------------------------------------------------------- one request */
@@ -249,6 +265,44 @@ export function createOrchestrator(deps) {
     return data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? ''
   }
 
+  /* Which engine this agent is thinking on. Read from the profile/home patch
+   * (the same layers the Harness applies), never guessed. If a fleet engine
+   * shares that authority, its measured rates were taken under load and the
+   * planner must not treat it as free capacity. */
+  function hostRoute() {
+    const candidates = []
+    if (process.env.DSH_HOME) candidates.push(joinPath(process.env.DSH_HOME, 'cordis.patch.yml'))
+    if (process.env.DSH_PROFILE_DIR) candidates.push(joinPath(process.env.DSH_PROFILE_DIR, 'cordis.patch.yml'))
+    for (const home of [process.env.DSH_HOME, joinPath(homedir(), '.dsh')]) {
+      if (!home) continue
+      try {
+        for (const name of readdirSync(joinPath(home, 'profiles'))) candidates.push(joinPath(home, 'profiles', name, 'cordis.patch.yml'))
+      } catch {}
+    }
+    const tried = []
+    for (const file of candidates) {
+      tried.push(file)
+      let text = ''
+      try {
+        text = readFileSync(file, 'utf8')
+      } catch {
+        continue
+      }
+      if (!text) continue
+      const block = text.match(/- id: agent-default-model[\s\S]{0,200}?config:\s*\n([\s\S]{0,400})/)
+      if (!block) continue
+      const provider = (block[1].match(/^\s*provider:\s*(\S+)/m) ?? [])[1]
+      const model = (block[1].match(/^\s*model:\s*(\S+)/m) ?? [])[1]
+      if (!provider) continue
+      let baseURL = ''
+      const listForm = text.match(new RegExp(`- name: ${provider}\\b[\\s\\S]{0,400}?baseURL: *(\\S+)`))
+      const dictForm = text.match(new RegExp(`\\b${provider}:\\s*\\n(?:\\s+[^\\n]+\\n){0,8}?\\s+baseURL: *(\\S+)`))
+      baseURL = (listForm ?? dictForm ?? [])[1] ?? ''
+      return { found: true, provider, model, baseURL, authority: authorityOfUrl(baseURL), file, note: baseURL ? 'read from the profile patch' : 'the patch names a provider but no baseURL line was found' }
+    }
+    return { found: false, tried }
+  }
+
   /* --------------------------------------------------------------- capability */
 
   const PROBE_ITEMS = [
@@ -322,6 +376,34 @@ export function createOrchestrator(deps) {
           if (verdict.pass) passed += 1
           scores[item.kind] = { pass: Boolean(verdict.pass), why: verdict.why, score: verdict.pass ? 10 : 2, ms: outcome.elapsedMs, tokPerSec: outcome.tokPerSec }
         }
+        // Throughput is split, because prefill and decode are different
+        // bottlenecks: a box that eats a 20k-token brief at 200 tok/s is a
+        // different proposition from one that generates at 90 tok/s. Two calls
+        // with the same instruction and different input sizes give the delta.
+        const instruction = 'List exactly five numbered items, one word each, about parallel computing.'
+        const short = await chat({ provider, model, messages: [{ role: 'user', content: instruction }], maxTokens: 200, temperature: 0, timeoutMs: 120000 })
+        const long = await chat({
+          provider,
+          model,
+          messages: [{ role: 'user', content: 'Filler to force prefill: ' + 'the quick brown fox jumps over the lazy dog. '.repeat(400) + '\n' + instruction }],
+          maxTokens: 200,
+          temperature: 0,
+          timeoutMs: 240000,
+        })
+        let throughput = { ok: false }
+        if (short.ok && long.ok && long.promptTokens > short.promptTokens && long.elapsedMs > short.elapsedMs) {
+          const prefill = round2((long.promptTokens - short.promptTokens) / ((long.elapsedMs - short.elapsedMs) / 1000))
+          const decodeMs = short.elapsedMs - (short.promptTokens / prefill) * 1000
+          throughput = {
+            ok: true,
+            prefillTokPerSec: prefill,
+            decodeTokPerSec: decodeMs > 200 ? round2(short.completionTokens / (decodeMs / 1000)) : null,
+            ttftMs: short.promptTokens > 0 ? Math.round(short.promptTokens / prefill * 1000) : null,
+            shortMs: short.elapsedMs,
+            longMs: long.elapsedMs,
+          }
+        }
+
         const row = {
           engine: provider.name,
           model: model.id,
@@ -329,7 +411,9 @@ export function createOrchestrator(deps) {
           scores,
           passed,
           probed: probeItems.length,
-          tokPerSec: totalMs > 0 ? round2((totalTokens / totalMs) * 1000) : null,
+          tokPerSec: totalMs > 0 ? round2((totalTokens / totalMs) * 1000) : throughput.prefillTokPerSec ?? null,
+          decodeTokPerSec: throughput.decodeTokPerSec ?? null,
+          prefillTokPerSec: throughput.prefillTokPerSec ?? null,
           probeTokens: totalTokens,
         }
         perModel.push(row)
@@ -384,32 +468,46 @@ export function createOrchestrator(deps) {
     return { errors, warnings }
   }
 
+  function rateOf(stamp, kind) {
+    if (!stamp) return kind === 'decode' ? opt.fallbackTokPerSec : opt.fallbackPrefillTokPerSec
+    if (kind === 'decode') return stamp.decodeTokPerSec ?? stamp.tokPerSec ?? opt.fallbackTokPerSec
+    return stamp.prefillTokPerSec ?? (stamp.tokPerSec ?? opt.fallbackTokPerSec) * 0.35
+  }
+
   function estimateSchedule(chunks) {
     const rows = []
     const index = providersByName()
+    const self = hostRoute()
     for (const chunk of chunks) {
       const provider = index.get(chunk.engine)
       const model = modelOf(provider, chunk.model ?? provider?.models?.[0]?.id)
       const stamp = benchCache().rows[`${chunk.engine}::${model?.id}`]
-      const tokPerSec = stamp?.tokPerSec ?? opt.fallbackTokPerSec
+      const authority = authorityOfUrl(provider?.baseURL ?? '')
+      const shared = Boolean(self?.authority) && authorityMatch(self.authority, authority)
+      // Contention is real on the box that also runs this agent. It is priced
+      // only when the user sets orchestration.selfContentionPercent.
+      const penalty = shared && Number.isFinite(opt.selfContentionPercent) ? Math.min(1, Math.max(0.2, opt.selfContentionPercent / 100)) : 1
+      const decode = rateOf(stamp, 'decode') * penalty
+      const prefill = rateOf(stamp, 'prefill') * penalty
       const output = Number(chunk.maxTokens) || opt.chunkOutputTokens
       const messages = Array.isArray(chunk.messages) ? chunk.messages : [{ role: 'user', content: chunk.prompt }]
       const input = estimateMessages(messages)
-      // prefill is charged at a conservative fraction of decode throughput.
-      const ms = Math.round((output / tokPerSec) * 1000 + (input / (tokPerSec * 0.35)) * 1000)
-      rows.push({ id: chunk.id, engine: chunk.engine, model: model?.id ?? chunk.model, input, output, tokPerSec, measured: Boolean(stamp?.tokPerSec), estMs: ms })
+      const ms = Math.round((output / decode) * 1000 + (input / prefill) * 1000)
+      rows.push({ id: chunk.id, engine: chunk.engine, model: model?.id ?? chunk.model, host: authority, sharedWithHost: shared, input, output, decodeTokPerSec: round2(decode), prefillTokPerSec: round2(prefill), measured: Boolean(stamp?.tokPerSec), estMs: ms })
     }
     const byEngine = new Map()
     for (const row of rows) byEngine.set(row.engine, [...(byEngine.get(row.engine) ?? []), row])
     const perEngineMs = [...byEngine.entries()].map(([engine, list]) => ({ engine, chunks: list.length, busyMs: list.reduce((sum, r) => sum + r.estMs, 0) }))
     const fleetMs = Math.max(0, ...perEngineMs.map((r) => r.busyMs))
-    const totalMs = rows.reduce((sum, r) => sum + r.estMs, 0)
     // Solo baseline = the single *best* box doing all the work, because that is
     // what the human is actually choosing between. Summing the mixed assignment
     // would flatter the split and hide a slow box sitting on the critical path.
-    const fastest = rows.some((r) => r.measured && r.tokPerSec) ? Math.max(...rows.filter((r) => r.measured).map((r) => r.tokPerSec)) : opt.fallbackTokPerSec
-    const soloMs = Math.round(rows.reduce((sum, r) => sum + r.estMs * (fastest > 0 && r.tokPerSec ? r.tokPerSec / fastest : 1), 0))
+    const best = rows.filter((r) => r.measured).sort((a, b) => b.decodeTokPerSec - a.decodeTokPerSec)[0]
+    const bestDecode = best?.decodeTokPerSec ?? opt.fallbackTokPerSec
+    const bestPrefill = best?.prefillTokPerSec ?? opt.fallbackPrefillTokPerSec
+    const soloMs = Math.round(rows.reduce((sum, r) => sum + (r.output / bestDecode) * 1000 + (r.input / bestPrefill) * 1000, 0))
     const unmeasured = rows.filter((r) => !r.measured).map((r) => r.id)
+    const sorted = perEngineMs.slice().sort((a, b) => b.busyMs - a.busyMs)
     return {
       chunks: rows,
       perEngine: perEngineMs,
@@ -417,12 +515,88 @@ export function createOrchestrator(deps) {
       fleetMs,
       speedup: fleetMs > 0 ? round2(soloMs / fleetMs) : null,
       recommendSplit: fleetMs > 0 && soloMs / fleetMs >= (opt.minSpeedup ?? 1.4),
+      criticalPath: sorted[0]?.engine ?? null,
+      idleSlackMs: sorted.length > 1 ? sorted[0].busyMs - sorted[sorted.length - 1].busyMs : 0,
       estimateQuality: unmeasured.length ? `unmeasured: ${unmeasured.join(', ')} (assumed ${opt.fallbackTokPerSec} tok/s — run bench first)` : 'measured',
       unmeasured,
     }
   }
 
-  async function plan({ chunks, taskClass } = {}) {
+  /* Longest-processing-time packing: the mechanical half of "which box gets
+   * which chunk". The agent decides what a chunk means; this only balances load
+   * against measured rates, and it never invents an engine.
+   *
+   * Two objectives, because they disagree:
+   *   speed  -> minimum makespan. The packer will happily starve a slow box.
+   *   spread -> use every engine the task can fit on, accepting a larger
+   *              makespan. This is what "all my computers work" means.
+   * Both numbers are returned so the gate can show the cost of utilisation.
+   */
+  function rebalance(chunks, taskClass, mode = 'spread') {
+    const index = providersByName()
+    const workOf = (chunk) => {
+      const messages = Array.isArray(chunk.messages) ? chunk.messages : [{ role: 'user', content: chunk.prompt }]
+      return { input: estimateMessages(messages), output: Number(chunk.maxTokens) || opt.chunkOutputTokens }
+    }
+    const priced = chunks.map((chunk) => {
+      const { input, output } = workOf(chunk)
+      const options = [...index.keys()].map((name) => {
+        const provider = index.get(name)
+        const model = provider.models?.[0]
+        const stamp = benchCache().rows[`${name}::${model?.id}`]
+        return {
+          engine: name,
+          model: model?.id,
+          ms: Math.round((output / rateOf(stamp, 'decode')) * 1000 + (input / rateOf(stamp, 'prefill')) * 1000),
+          fits: input + output <= (model?.contextWindow ?? opt.fallbackContextWindow),
+          measured: Boolean(stamp?.tokPerSec),
+        }
+      })
+      return { id: chunk.id, role: chunk.role ?? 'worker', work: input + output, options }
+    })
+    priced.sort((a, b) => b.work - a.work)
+
+    function pack(forceSpread) {
+      const load = new Map()
+      const assignment = []
+      const usableEngines = [...index.keys()].filter((name) => priced.some((item) => item.options.some((option) => option.engine === name && option.fits)))
+      for (const item of priced) {
+        const usable = item.options.filter((option) => option.fits)
+        if (!usable.length) { assignment.push({ id: item.id, engine: null, reason: 'no engine can hold this chunk inside its context window' }); continue }
+        const empty = forceSpread ? usableEngines.filter((name) => !load.has(name) && usable.some((option) => option.engine === name)) : []
+        const pool = empty.length ? usable.filter((option) => empty.includes(option.engine)) : usable
+        pool.sort((a, b) => (a.ms + (load.get(a.engine) ?? 0)) - (b.ms + (load.get(b.engine) ?? 0)))
+        const pick = pool[0]
+        load.set(pick.engine, (load.get(pick.engine) ?? 0) + pick.ms)
+        assignment.push({ id: item.id, role: item.role, engine: pick.engine, model: pick.model, estMs: pick.ms, measured: pick.measured, movedFrom: null })
+      }
+      return { assignment, makespanMs: Math.max(0, ...[...load.values()]) }
+    }
+
+    const spread = pack(true)
+    const speed = pack(false)
+    const chosen = mode === 'speed' ? speed : spread
+    const original = new Map(chunks.map((chunk) => [chunk.id, chunk.engine]))
+    for (const row of chosen.assignment) if (row.engine && original.get(row.id) !== row.engine) row.movedFrom = original.get(row.id)
+    return {
+      ok: true,
+      mode,
+      taskClass: taskClass ?? null,
+      assignment: chosen.assignment,
+      makespanMs: chosen.makespanMs,
+      moved: chosen.assignment.filter((row) => row.movedFrom).length,
+      objectives: {
+        spread: { makespanMs: spread.makespanMs, enginesUsed: new Set(spread.assignment.filter((r) => r.engine).map((r) => r.engine)).size },
+        speed: { makespanMs: speed.makespanMs, enginesUsed: new Set(speed.assignment.filter((r) => r.engine).map((r) => r.engine)).size },
+      },
+      tradeoff: spread.makespanMs > speed.makespanMs
+        ? `Using every box costs ${Math.round((spread.makespanMs - speed.makespanMs) / 1000)}s more than letting only the fastest box do the work.`
+        : 'Every engine is already needed; utilisation costs nothing here.',
+      note: 'LPT packing on measured rates. It balances load; it does not know what a chunk means — keep role/semantics the agent chose.',
+    }
+  }
+
+  async function plan({ chunks, taskClass, balance = true } = {}) {
     if (!Array.isArray(chunks) || !chunks.length) return { ok: false, error: 'plan needs a chunks array' }
     const { errors, warnings } = validate(chunks)
     const estimate = estimateSchedule(chunks)
@@ -433,6 +607,8 @@ export function createOrchestrator(deps) {
       errors,
       warnings,
       estimate,
+      balance: balance ? rebalance(chunks, taskClass) : null,
+      self: fingerprint.self,
       engines: fingerprint.engines.filter((row) => row.hasKey),
       gateRule: `Split is offered when speedup ≥ ${opt.minSpeedup ?? 1.4}; below that the honest answer is Solo.`,
       askUser: errors.length === 0 ? 'Present this estimate to the user and ask: Split / Solo / Adjust. Then call run with gate {asked:true, answer:"split"} only if they chose Split.' : 'Fix the errors, then plan again.',
@@ -662,7 +838,7 @@ export function createOrchestrator(deps) {
     return { ok: true, run: record, markdown: summaryMarkdown(record) }
   }
 
-  return { engines, bench, plan, run, runs, runView, estimateSchedule, validate, grade, PROBE_ITEMS }
+  return { engines, bench, plan, run, runs, runView, estimateSchedule, rebalance, validate, grade, hostRoute, PROBE_ITEMS }
 }
 
 /* ------------------------------------------------------------------- helpers */
@@ -673,6 +849,15 @@ function authorityOfUrl(value) {
   } catch {
     return String(value ?? '')
   }
+}
+
+function authorityMatch(a, b) {
+  const norm = (value) => {
+    const [host, port] = String(value ?? '').split(':')
+    const hostNorm = host === 'localhost' ? '127.0.0.1' : host
+    return `${hostNorm}:${port ?? ''}`
+  }
+  return norm(a) === norm(b)
 }
 
 function isLocalAuthority(authority) {

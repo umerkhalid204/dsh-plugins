@@ -122,6 +122,7 @@ window.__ModuleLoader__.load({
   font-size:11px; display:inline-block; white-space:nowrap; }
 .fl-chip-pass { color:var(--dsw-alias-state-success-primary); }
 .fl-chip-fail { color:var(--dsw-alias-state-error-primary); }
+.fl-chip-warn { color:var(--dsw-alias-state-warn-primary); }
 .fl-chip-none { color:var(--dsw-alias-state-idle-primary); }
 .fl-card { background:var(--dsw-alias-bg-layer-2); border:1px solid var(--dsw-alias-border-l1);
   border-radius:8px; padding:9px 11px; display:flex; flex-direction:column; gap:5px; }
@@ -270,8 +271,10 @@ window.__ModuleLoader__.load({
           busyMs: asNumber(row && row.busyMs),
           rate: asNumber(row && row.tokPerSec),
           rates: [],
-          gradedPass: asNumber(row && row.gradedPass),
-          gradedTotal: asNumber(row && row.gradedTotal),
+          // The Host reports these two as integers: `graded` counts chunks that had
+          // a local grader at all, `verdicts` counts how many of those passed.
+          gradedPass: asNumber(row && row.verdicts),
+          gradedTotal: asNumber(row && row.graded),
           outputTokens: asNumber(row && row.outputTokens),
           derived: false,
         }))
@@ -1211,6 +1214,7 @@ window.__ModuleLoader__.load({
         limits.chunkWallClockMs === undefined ? '' : `chunk wall clock ${fmtDuration(limits.chunkWallClockMs)}`,
       ].filter(Boolean).join(' · ')
       const anyBench = Object.keys(busy).some((key) => key.indexOf('bench:') === 0)
+      const benchRunningTip = 'A bench is already running. This page may have started it, and the Host keeps benching even after this page closes — closing the page does not stop it. One queue per engine: wait for it to finish.'
 
       return h('div', { className: 'fl-panel' },
         h('div', { className: 'fl-panel-head' }, 'Engines',
@@ -1222,7 +1226,7 @@ window.__ModuleLoader__.load({
             className: 'fl-btn fl-btn-brand',
             disabled: anyBench,
             title: anyBench
-              ? 'A bench is already running. One queue per engine: wait for it to finish.'
+              ? benchRunningTip
               : 'Run the task-shaped probes against every endpoint and cache the measurements. Roughly 10–40 s per engine.',
             onClick: () => onBench(null),
           }, busy['bench:all'] === true ? 'Benching…' : 'Bench now')),
@@ -1272,7 +1276,9 @@ window.__ModuleLoader__.load({
                 h('td', null, h('div', { className: 'fl-actions' },
                   h('button', {
                     className: 'fl-btn fl-btn-sm', disabled: rowBusy,
-                    title: `Re-probe ${name}${model ? ` on ${model}` : ''} with the task-shaped probes.`,
+                    title: rowBusy
+                      ? benchRunningTip
+                      : `Re-probe ${name}${model ? ` on ${model}` : ''} with the task-shaped probes.`,
                     onClick: () => onBench(name),
                   }, rowBusy ? 'Benching…' : 'Bench'))))
             })))
@@ -1293,11 +1299,14 @@ window.__ModuleLoader__.load({
               const runId = str(run && run.runId) || `run-${index + 1}`
               const done = asNumber(run && run.done)
               const chunks = asNumber(run && run.chunks)
-              const enginesCell = Array.isArray(run && run.engines)
-                ? (run.engines.length
-                  ? (run.engines.map((entry) => str(entry && entry.engine) || str(entry)).filter(Boolean).join(', ') || `${run.engines.length} engines`)
-                  : 'none')
-                : run && run.engines === undefined ? '—' : `${str(run.engines)} engine${Number(run.engines) === 1 ? '' : 's'}`
+              // `engines` is always an array of unique engine names; anything else
+              // is an unknown shape, so it gets a dash rather than a made-up count.
+              const engineNames = Array.isArray(run && run.engines)
+                ? arr(run.engines).map((entry) => str(entry && entry.engine) || str(entry)).filter(Boolean)
+                : null
+              const enginesCell = engineNames === null
+                ? '—'
+                : engineNames.length ? engineNames.join(', ') : 'none'
               return h('tr', { key: runId },
                 h('td', null,
                   h('button', {
@@ -1319,6 +1328,8 @@ window.__ModuleLoader__.load({
       const [view, setView] = useState(null)
       const [error, setError] = useState('')
       const [nonce, setNonce] = useState(0)
+      const [markdown, setMarkdown] = useState('')
+      const [note, setNote] = useState(null)
 
       useEffect(() => {
         const controller = new AbortController()
@@ -1332,6 +1343,8 @@ window.__ModuleLoader__.load({
           }
           setError('')
           setView(obj(result.data && result.data.run))
+          setMarkdown(str(result.data && result.data.markdown))
+          setNote(null)
         }
         void load()
         return () => {
@@ -1340,9 +1353,34 @@ window.__ModuleLoader__.load({
         }
       }, [runId, nonce])
 
+      // The markdown the Host returns is the same text it wrote into the run's
+      // SUMMARY.md, so copying it is the shareable artifact.
+      const copyMarkdown = async () => {
+        if (!markdown) return
+        setNote(null)
+        if (typeof navigator === 'undefined' || !navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
+          setNote({ tone: 'error', text: 'This browser did not expose a clipboard, so nothing was copied. The summary is still in SUMMARY.md inside the run directory above.' })
+          return
+        }
+        try {
+          await navigator.clipboard.writeText(markdown)
+          setNote({ tone: 'ok', text: 'Summary copied to the clipboard. It is the same markdown the Host wrote to SUMMARY.md.' })
+        } catch (copyError) {
+          setNote({ tone: 'error', text: `The clipboard refused the text: ${str(copyError && copyError.message) || str(copyError)}. The summary is still in SUMMARY.md inside the run directory above.` })
+        }
+      }
+
       const chunks = arr(view && view.chunks)
       const rollup = engineRollup(view)
       const estimate = obj(view && view.estimate)
+      const estimateQuality = str(estimate && estimate.estimateQuality)
+      const estimatedBusy = Array.isArray(estimate && estimate.perEngine)
+        ? estimate.perEngine.map((row, index) => {
+          const name = str(row && row.engine) || `engine-${index + 1}`
+          const busy = asNumber(row && row.busyMs)
+          return `${name} ${busy === null ? 'not reported' : fmtDuration(busy)}`
+        }).join(' · ')
+        : ''
 
       return h(Drawer, {
         title: fmtText(view && view.title, fmtText(run && run.title, 'Fleet run')),
@@ -1350,11 +1388,19 @@ window.__ModuleLoader__.load({
         onClose,
         footer: [
           h('button', { key: 'r', className: 'fl-btn', onClick: () => setNonce((value) => value + 1) }, 'Reload run record'),
+          h('button', {
+            key: 'c', className: 'fl-btn fl-btn-brand', disabled: !markdown,
+            title: markdown
+              ? 'Copy the run summary to the clipboard. It is the same markdown the Host writes to SUMMARY.md in the run directory.'
+              : 'The Host returned no markdown for this run, so there is nothing to copy.',
+            onClick: () => { void copyMarkdown() },
+          }, 'Copy markdown'),
           h('div', { key: 's', className: 'fl-spacer' }),
           h('div', { key: 'n', className: 'fl-sub' }, view ? `${chunks.length} chunk${chunks.length === 1 ? '' : 's'}` : 'Reading…'),
         ],
       },
         error ? h('div', { className: 'fl-err' }, error) : null,
+        note ? h('div', { className: note.tone === 'ok' ? 'fl-ok' : 'fl-line-error' }, note.text) : null,
         view === null && !error ? h('div', { className: 'fl-empty' }, 'Reading the run record…') : null,
         view ? h('div', { className: 'fl-kv' },
           h('div', null, [
@@ -1369,9 +1415,15 @@ window.__ModuleLoader__.load({
             estimate.fleetMs === undefined ? '' : `fleet ${fmtDuration(estimate.fleetMs)}`,
             estimate.speedup === undefined ? '' : `speedup ${str(estimate.speedup)}×`,
             estimate.recommendSplit === undefined ? '' : `split recommended: ${String(estimate.recommendSplit)}`,
-            estimate.estimateQuality === undefined ? '' : `estimate quality ${str(estimate.estimateQuality)}`,
             estimate.unmeasured === undefined ? '' : `unmeasured engines: ${str(estimate.unmeasured)}`,
-          ].filter(Boolean).join(' · ')) : null) : null,
+          ].filter(Boolean).join(' · ')) : null,
+          estimateQuality ? h('div', {
+            className: /^unmeasured/i.test(estimateQuality) ? 'fl-line-warn' : 'fl-muted',
+            title: /^unmeasured/i.test(estimateQuality)
+              ? 'These engines had no measurement when the plan was priced, so their share of the estimate is a fallback number, not a measured speed.'
+              : 'Every engine in this plan had a measured speed when the estimate was priced.',
+          }, `Estimate quality: ${estimateQuality}`) : null,
+          estimatedBusy ? h('div', { className: 'fl-muted', title: 'Busy time the plan estimated for each engine, before the run started.' }, `Estimated busy per engine: ${estimatedBusy}`) : null) : null,
 
         view ? h('div', { className: 'fl-note' },
           'The Host enforces the split gate: the agent must ask first, and every chunk comes back as an artifact. No other machine writes to this working tree.') : null,
@@ -1393,8 +1445,8 @@ window.__ModuleLoader__.load({
                   ? 'Busy time is the sum of this engine’s chunk wall clocks: the Host did not report busyMs for this run.'
                   : 'Busy time as reported by the Host.'
                 const gradedTip = row.derived
-                  ? 'Graded pass counted from the chunk verdicts in the payload.'
-                  : 'Graded counts as reported by the Host.'
+                  ? 'Graded counts counted from the chunk verdicts in the payload: chunks that had a grader, and how many of those passed.'
+                  : 'Graded counts as reported by the Host: chunks that had a local grader at all, and how many of those passed.'
                 return h('tr', { key: `${row.engine}:${index}` },
                   h('td', { className: 'fl-mono' }, row.engine),
                   h('td', { className: 'fl-muted' }, row.host || '—'),
@@ -1404,9 +1456,12 @@ window.__ModuleLoader__.load({
                   h('td', { className: row.failed ? 'fl-num fl-line-error' : 'fl-num' }, row.failed === null ? '—' : String(row.failed)),
                   h('td', { className: 'fl-num', title: busyTip }, fmtDuration(row.busyMs) || '—'),
                   h('td', { className: 'fl-num' }, rate === null ? '—' : fmtRate(rate)),
-                  h('td', { title: gradedTip },
-                    row.gradedTotal ? `${row.gradedPass || 0}/${row.gradedTotal} pass`
-                      : row.gradedPass === null || row.gradedTotal === null ? 'not reported' : 'not graded'),
+                  h('td', { className: 'fl-num', title: gradedTip },
+                    row.gradedTotal === null
+                      ? 'not reported'
+                      : row.gradedTotal === 0
+                        ? 'not graded'
+                        : `${row.gradedPass === null ? 0 : row.gradedPass}/${row.gradedTotal}`),
                   h('td', { className: 'fl-num' }, row.outputTokens === null ? '—' : String(row.outputTokens)))
               }))))
           : null,
@@ -1419,12 +1474,37 @@ window.__ModuleLoader__.load({
             const statusClass = DONE_STATUSES.indexOf(lowered) >= 0 ? 'fl-chip fl-chip-pass'
               : (FAILED_STATUSES.indexOf(lowered) >= 0 || (chunk && chunk.timedOut === true)) ? 'fl-chip fl-chip-fail'
                 : 'fl-chip fl-chip-none'
+            const attempts = asNumber(chunk && chunk.attempts)
+            const escalatedFrom = asNumber(chunk && chunk.escalatedFrom)
+            const reasoningTokens = asNumber(chunk && chunk.reasoningTokens)
+            const finish = str(chunk && chunk.finish)
+            const truncated = finish === 'length'
             const timings = [
               chunk.wallClockMs === undefined ? '' : `wall ${fmtDuration(chunk.wallClockMs)}`,
               chunk.tokPerSec === undefined ? '' : `${fmtRate(chunk.tokPerSec)} tok/s`,
               chunk.outputTokens === undefined ? '' : `${str(chunk.outputTokens)} tokens out`,
               chunk.inputTokens === undefined ? '' : `${str(chunk.inputTokens)} in`,
+              reasoningTokens === null ? '' : `${reasoningTokens} reasoning`,
             ].filter(Boolean).join(' · ')
+            const verdictTip = verdict && str(verdict.coverage) ? `Grader coverage ${str(verdict.coverage)}.` : ''
+            const attemptsLine = attempts === null
+              ? null
+              : h('div', {
+                className: attempts > 1 ? 'fl-line-warn' : 'fl-muted',
+                title: attempts > 1
+                  ? `This chunk ran ${attempts} times. The Host re-ran it with a bigger token budget because the first pack spent its whole budget thinking${escalatedFrom === null ? '' : ` (it started at ${escalatedFrom} tokens)`}.`
+                  : 'This chunk ran once, on its first token budget.',
+              }, attempts > 1
+                ? `Attempts: ${attempts}${escalatedFrom === null ? '' : ` · first try capped at ${escalatedFrom} tokens`}`
+                : `Attempts: ${attempts}`)
+            const truncationLine = truncated
+              ? h('div', { className: verdict && verdict.graded === true && verdict.pass !== true ? 'fl-line-error' : 'fl-line-warn' },
+                verdict && verdict.graded === true && verdict.pass !== true
+                  ? 'Truncated, not wrong: the output hit the token cap (finish: length) before the answer was complete, so the grader failed a cut-off artifact.'
+                  : verdict && verdict.graded === true && verdict.pass === true
+                    ? 'It passed the grader, but the output still hit the token cap (finish: length).'
+                    : 'The output hit the token cap (finish: length): the returned artifact may be cut off.')
+              : null
             return h('div', {
               className: 'fl-card', key: `${str(chunk && chunk.id) || 'chunk'}:${index}`,
             },
@@ -1433,15 +1513,25 @@ window.__ModuleLoader__.load({
                 h('span', { className: 'fl-chip fl-chip-none' }, fmtText(chunk && chunk.role, 'no role reported')),
                 h('span', { className: statusClass }, status || 'no status reported'),
                 chunk && chunk.timedOut === true ? h('span', { className: 'fl-chip fl-chip-fail' }, 'timed out') : null,
+                finish
+                  ? h('span', {
+                    className: truncated ? 'fl-chip fl-chip-warn' : 'fl-chip fl-chip-none',
+                    title: truncated
+                      ? 'The model ran out of output tokens: generation stopped at the cap, so the artifact may be cut off.'
+                      : 'The model stopped on its own (finish: stop): the output was complete.',
+                  }, `finish: ${finish}`)
+                  : null,
                 h('span', { className: 'fl-spacer' }),
                 h('span', { className: 'fl-mono fl-muted' }, [str(chunk && chunk.engine), str(chunk && chunk.host), str(chunk && chunk.model)].filter(Boolean).join(' · ') || 'no assignment reported')),
               str(chunk && chunk.error) ? h('div', { className: 'fl-line-error' }, str(chunk.error)) : null,
               !verdict
                 ? h('div', { className: 'fl-muted' }, 'No verdict reported for this chunk.')
                 : verdict.graded !== true
-                  ? h('div', { className: 'fl-muted' }, `Not graded${str(verdict.why) ? `: ${str(verdict.why)}` : '.'}`)
-                  : h('div', { className: verdict.pass === true ? 'fl-ok' : 'fl-line-error' },
+                  ? h('div', { className: 'fl-muted', title: verdictTip }, `Not graded${str(verdict.why) ? `: ${str(verdict.why)}` : '.'}`)
+                  : h('div', { className: verdict.pass === true ? 'fl-ok' : 'fl-line-error', title: verdictTip },
                     `${verdict.pass === true ? 'Graded pass' : 'Graded fail'}${str(verdict.why) ? `: ${str(verdict.why)}` : ''}`),
+              truncationLine,
+              attemptsLine,
               timings ? h('div', { className: 'fl-muted' }, timings) : h('div', { className: 'fl-muted' }, 'No timings reported.'),
               Array.isArray(chunk && chunk.writes)
                 ? h('div', { className: 'fl-muted' }, chunk.writes.length
