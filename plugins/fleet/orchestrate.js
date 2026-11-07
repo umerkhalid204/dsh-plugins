@@ -675,8 +675,19 @@ export function createOrchestrator(deps) {
     return { ran: true, engines: names, probed: (result.bench ?? []).filter((row) => !row.cached).length, cached: (result.bench ?? []).filter((row) => row.cached).length }
   }
 
-  async function plan({ chunks, taskClass, balance = true, sessionId = null } = {}) {
+  async function plan({ chunks, taskClass, balance = true, sessionId = null, preview = false } = {}) {
     if (!Array.isArray(chunks) || !chunks.length) return { ok: false, error: 'plan needs a chunks array' }
+    /* Gate planning too. Authoring a chunk DAG costs the agent several inference
+     * steps; if the user never armed the split, those steps are wasted and the
+     * run would be refused anyway. `preview: true` is the explicit escape hatch
+     * for "show me what a split would look like". */
+    if (opt.requireTrigger !== false && !preview && !triggers(sessionId).length) {
+      return {
+        ok: false,
+        error: `No fleet trigger in this session, so planning a split is wasted work: run() would refuse it. Ask the user first — if they want the fleet they write ${opt.keywords.join(' or ')}. Pass preview:true only to show a hypothetical estimate.`,
+        keywords: opt.keywords,
+      }
+    }
     const measured = await ensureMeasured(chunks)
     const { errors, warnings } = validate(chunks, sessionId)
     const estimate = estimateSchedule(chunks, sessionId)
