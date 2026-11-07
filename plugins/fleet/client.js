@@ -24,6 +24,10 @@ window.__ModuleLoader__.load({
       logs: '/fleet/api/logs',
       open: '/fleet/api/open',
       install: '/fleet/api/install-runtime',
+      engines: '/fleet/api/engines',
+      bench: '/fleet/api/bench',
+      runs: '/fleet/api/runs',
+      runView: '/fleet/api/run-view',
     }
 
     const PAGE_MS = 4000
@@ -111,6 +115,21 @@ window.__ModuleLoader__.load({
 .fl-output { flex:0 0 auto; max-height:190px; }
 .fl-link { color:var(--dsw-alias-brand-primary); text-decoration:none; }
 .fl-link:hover { text-decoration:underline; }
+.fl-section { display:flex; flex-direction:column; gap:10px; }
+.fl-section-head { font-size:13.5px; font-weight:600; }
+.fl-chipbar { display:flex; gap:4px; flex-wrap:wrap; align-items:center; }
+.fl-chip { border:1px solid var(--dsw-alias-border-l1); border-radius:999px; padding:1px 7px;
+  font-size:11px; display:inline-block; white-space:nowrap; }
+.fl-chip-pass { color:var(--dsw-alias-state-success-primary); }
+.fl-chip-fail { color:var(--dsw-alias-state-error-primary); }
+.fl-chip-none { color:var(--dsw-alias-state-idle-primary); }
+.fl-card { background:var(--dsw-alias-bg-layer-2); border:1px solid var(--dsw-alias-border-l1);
+  border-radius:8px; padding:9px 11px; display:flex; flex-direction:column; gap:5px; }
+.fl-card-head { display:flex; gap:8px; align-items:baseline; flex-wrap:wrap; }
+.fl-row-btn { background:transparent; border:none; padding:0; color:var(--dsw-alias-brand-primary);
+  cursor:pointer; font-size:12.5px; text-align:left; }
+.fl-row-btn:hover { text-decoration:underline; }
+.fl-preview { max-height:150px; overflow:auto; }
 .fl-kv { display:flex; flex-direction:column; gap:3px; font-size:11.5px; color:var(--dsw-alias-label-secondary); }
 `
 
@@ -125,6 +144,9 @@ window.__ModuleLoader__.load({
     const str = (value) => (typeof value === 'string' ? value : value === undefined || value === null ? '' : String(value))
     const obj = (value) => (value && typeof value === 'object' && !Array.isArray(value) ? value : null)
     const asNumber = (value) => {
+      // A JSON null or an omitted field must stay "not reported": Number(null) is
+      // 0, which would otherwise render a real-looking zero everywhere.
+      if (value === null || value === undefined || value === '') return null
       const n = typeof value === 'number' ? value : Number(value)
       return Number.isFinite(n) ? n : null
     }
@@ -156,7 +178,108 @@ window.__ModuleLoader__.load({
       return value === null ? '' : new Date(value).toLocaleTimeString()
     }
 
-    // ---------- one fetch helper: never throws, always {ok,data} or {ok,error} ----------
+    function fmtRate(value) {
+      const n = asNumber(value)
+      if (n === null) return ''
+      return n >= 10 ? n.toFixed(0) : n.toFixed(1)
+    }
+
+    function fmtDuration(value) {
+      const n = asNumber(value)
+      if (n === null) return ''
+      if (n < 1000) return `${Math.round(n)} ms`
+      const secs = n / 1000
+      if (secs < 90) return `${secs.toFixed(secs < 10 ? 1 : 0)} s`
+      const mins = Math.floor(secs / 60)
+      if (mins < 120) return `${mins}m ${Math.round(secs % 60)}s`
+      return `${Math.floor(mins / 60)}h ${mins % 60}m`
+    }
+
+    function fmtNumber(value, suffix) {
+      const n = asNumber(value)
+      if (n === null) return ''
+      return `${n}${suffix || ''}`
+    }
+
+    function fmtText(value, fallback) {
+      const text = str(value)
+      return text || fallback
+    }
+
+    // The Host's built-in probe trio. Any extra kind it reports is shown too, so a
+    // newer build adding a probe never hides its result.
+    const PROBE_KINDS = ['constraint', 'coverage', 'grounding']
+
+    function scoreMap(engine) {
+      return obj(engine && engine.measured && engine.measured.scores) || {}
+    }
+
+    function scoreKinds(engine) {
+      const seen = Object.keys(scoreMap(engine))
+      return PROBE_KINDS.concat(seen.filter((kind) => PROBE_KINDS.indexOf(kind) < 0))
+    }
+
+    // Chunk status vocabulary comes straight from the Host. These buckets only
+    // count what the payload says; the raw status is always shown as-is too.
+    const DONE_STATUSES = ['done', 'ok', 'completed', 'succeeded']
+    const FAILED_STATUSES = ['failed', 'error', 'refused', 'timeout', 'timed-out', 'timed_out']
+
+    function rollupFromChunks(chunks) {
+      const rows = new Map()
+      for (const chunk of chunks) {
+        const key = str(chunk && chunk.engine) || 'unassigned'
+        if (!rows.has(key)) {
+          rows.set(key, {
+            engine: key, host: str(chunk && chunk.host), model: str(chunk && chunk.model),
+            chunkCount: 0, done: 0, failed: 0, busyMs: 0, rates: [], gradedPass: 0, gradedTotal: 0,
+            outputTokens: 0, derived: true,
+          })
+        }
+        const row = rows.get(key)
+        row.chunkCount += 1
+        const status = str(chunk && chunk.status).toLowerCase()
+        if (DONE_STATUSES.indexOf(status) >= 0) row.done += 1
+        else if (FAILED_STATUSES.indexOf(status) >= 0 || (chunk && chunk.timedOut === true)) row.failed += 1
+        const wall = asNumber(chunk && chunk.wallClockMs)
+        if (wall !== null) row.busyMs += wall
+        const rate = asNumber(chunk && chunk.tokPerSec)
+        if (rate !== null) row.rates.push(rate)
+        const verdict = obj(chunk && chunk.verdict)
+        if (verdict && verdict.graded === true) {
+          row.gradedTotal += 1
+          if (verdict.pass === true) row.gradedPass += 1
+        }
+        const tokens = asNumber(chunk && chunk.outputTokens)
+        if (tokens !== null) row.outputTokens += tokens
+      }
+      return Array.from(rows.values())
+    }
+
+    // Prefer the Host's own per-engine summary; fall back to counting chunk rows.
+    function engineRollup(run) {
+      const summary = obj(run && run.summary)
+      const reported = arr(summary && summary.perEngine)
+      if (reported.length) {
+        return reported.map((row) => ({
+          engine: str(row && row.engine) || 'unassigned',
+          host: str(row && row.host),
+          model: str(row && row.model),
+          chunkCount: Array.isArray(row && row.chunks) ? row.chunks.length : asNumber(row && row.chunks),
+          done: asNumber(row && row.done),
+          failed: asNumber(row && row.failed),
+          busyMs: asNumber(row && row.busyMs),
+          rate: asNumber(row && row.tokPerSec),
+          rates: [],
+          gradedPass: asNumber(row && row.gradedPass),
+          gradedTotal: asNumber(row && row.gradedTotal),
+          outputTokens: asNumber(row && row.outputTokens),
+          derived: false,
+        }))
+      }
+      return rollupFromChunks(arr(run && run.chunks))
+    }
+
+    // ---------- one fetch helper: never throws, always {ok,data} or {ok,error,status} ----------
     async function requestJson({ path, method = 'GET', body, signal }) {
       try {
         const response = await fetch(path, {
@@ -178,15 +301,15 @@ window.__ModuleLoader__.load({
           const suffix = response.status === 404
             ? ' — the fleet Host routes are not installed in this profile yet.'
             : ''
-          return { ok: false, error: `Fleet ${method} ${path} answered HTTP ${response.status}${suffix}` }
+          return { ok: false, status: response.status, error: `Fleet ${method} ${path} answered HTTP ${response.status}${suffix}` }
         }
         if (parsed.ok === false) {
-          return { ok: false, error: str(parsed.error) || `Fleet ${method} ${path} reported a failure.` }
+          return { ok: false, status: response.status, error: str(parsed.error) || `Fleet ${method} ${path} reported a failure.` }
         }
         if (!response.ok) {
-          return { ok: false, error: `Fleet ${method} ${path} answered HTTP ${response.status} without an error field.` }
+          return { ok: false, status: response.status, error: `Fleet ${method} ${path} answered HTTP ${response.status} without an error field.` }
         }
-        return { ok: true, data: parsed }
+        return { ok: true, status: response.status, data: parsed }
       } catch (error) {
         if (error && error.name === 'AbortError') return { ok: false, aborted: true, error: '' }
         return { ok: false, error: str(error && error.message) || str(error) || 'Request failed.' }
@@ -199,6 +322,11 @@ window.__ModuleLoader__.load({
       error: '',
       loading: false,
       fetchedAt: 0,
+      engines: null,
+      enginesError: '',
+      runs: null,
+      runsError: '',
+      orchestrationMissing: false,
       listeners: new Set(),
       kinds: new Map(),
       timer: 0,
@@ -208,29 +336,77 @@ window.__ModuleLoader__.load({
       pending: false,
       started: false,
       visibilityBound: false,
+      pendingOptions: {},
     }
 
     function snapshot() {
-      return { data: store.data, error: store.error, loading: store.loading, fetchedAt: store.fetchedAt }
+      return {
+        data: store.data,
+        error: store.error,
+        loading: store.loading,
+        fetchedAt: store.fetchedAt,
+        engines: store.engines,
+        enginesError: store.enginesError,
+        runs: store.runs,
+        runsError: store.runsError,
+        orchestrationMissing: store.orchestrationMissing,
+      }
     }
 
     function notify() {
       for (const listener of Array.from(store.listeners)) listener(snapshot())
     }
 
-    async function refresh() {
+    // One round reads the registry and, unless this install proved it has no
+    // orchestration routes, the engine catalog and the run list. A 404 on either
+    // orchestration route latches `orchestrationMissing` so the poller stops
+    // knocking on a route this build does not serve.
+    async function refresh(options) {
+      const probeOrchestration = options && options.recheckOrchestration === true
+      if (probeOrchestration) store.orchestrationMissing = false
       if (store.inFlight) {
         store.pending = true
+        store.pendingOptions = options || {}
         return
       }
       store.inFlight = true
       store.loading = true
       const controller = new AbortController()
       store.controller = controller
-      const result = await requestJson({ path: ROUTES.state, signal: controller.signal })
+      const wantOrchestration = !store.orchestrationMissing
+      const results = await Promise.all([
+        requestJson({ path: ROUTES.state, signal: controller.signal }),
+        wantOrchestration ? requestJson({ path: ROUTES.engines, signal: controller.signal }) : Promise.resolve(null),
+        wantOrchestration ? requestJson({ path: ROUTES.runs, signal: controller.signal }) : Promise.resolve(null),
+      ])
+      const [result, enginesResult, runsResult] = results
       store.inFlight = false
       store.loading = false
       if (store.controller === controller) store.controller = null
+
+      if (enginesResult && enginesResult.status === 404) {
+        store.orchestrationMissing = true
+        store.engines = null
+        store.enginesError = ''
+        store.runs = null
+        store.runsError = ''
+      } else if (enginesResult && !enginesResult.aborted) {
+        if (enginesResult.ok) {
+          store.engines = enginesResult.data
+          store.enginesError = ''
+        } else {
+          store.enginesError = enginesResult.error
+        }
+      }
+      if (runsResult && !store.orchestrationMissing && !runsResult.aborted) {
+        if (runsResult.ok) {
+          store.runs = arr(runsResult.data && runsResult.data.runs)
+          store.runsError = ''
+        } else {
+          store.runsError = runsResult.error
+        }
+      }
+
       if (result.aborted) {
         notify()
         return
@@ -245,8 +421,10 @@ window.__ModuleLoader__.load({
       store.fetchedAt = Date.now()
       notify()
       if (store.pending) {
+        const pendingOptions = store.pendingOptions
         store.pending = false
-        void refresh()
+        store.pendingOptions = {}
+        void refresh(pendingOptions)
       }
     }
 
@@ -1001,9 +1179,288 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // ---------- orchestration: engines, bench, runs ----------
+    function ProbeChip({ engine, kind }) {
+      const entry = obj(scoreMap(engine)[kind])
+      if (!entry) {
+        return h('span', { className: 'fl-chip fl-chip-none', title: `${kind}: this model has not been probed for it.` }, kind)
+      }
+      const passed = entry.pass === true
+      const details = [
+        entry.pass === undefined ? '' : (passed ? 'pass' : 'fail'),
+        entry.score === undefined ? '' : `score ${str(entry.score)}`,
+        entry.ms === undefined ? '' : fmtDuration(entry.ms),
+        entry.tokPerSec === undefined ? '' : `${fmtRate(entry.tokPerSec)} tok/s`,
+      ].filter(Boolean)
+      return h('span', {
+        className: passed ? 'fl-chip fl-chip-pass' : 'fl-chip fl-chip-fail',
+        title: `${kind}: ${details.join(' · ') || 'no detail reported'}`,
+      }, kind)
+    }
+
+    function EnginesPanel({ fleet, busy, onBench, onRecheck }) {
+      const catalog = obj(fleet.engines) || {}
+      const engines = arr(catalog.engines)
+      const limits = obj(catalog.limits) || {}
+      const cacheAge = asNumber(catalog.cacheAgeHours)
+      const limitsLine = [
+        limits.contextFill === undefined ? '' : `context cap ${str(limits.contextFill)}%`,
+        limits.perEngineConcurrency === undefined ? '' : `${str(limits.perEngineConcurrency)} chunk(s) per engine`,
+        limits.minSpeedup === undefined ? '' : `min speedup ${str(limits.minSpeedup)}×`,
+        limits.benchTtlHours === undefined ? '' : `measurements valid ${str(limits.benchTtlHours)} h`,
+        limits.chunkWallClockMs === undefined ? '' : `chunk wall clock ${fmtDuration(limits.chunkWallClockMs)}`,
+      ].filter(Boolean).join(' · ')
+      const anyBench = Object.keys(busy).some((key) => key.indexOf('bench:') === 0)
+
+      return h('div', { className: 'fl-panel' },
+        h('div', { className: 'fl-panel-head' }, 'Engines',
+          h('div', { className: 'fl-sub' }, cacheAge === null
+            ? (limitsLine || 'no measurements cached yet')
+            : [`${cacheAge} h since the last bench`, limitsLine].filter(Boolean).join(' · ')),
+          h('div', { className: 'fl-spacer' }),
+          h('button', {
+            className: 'fl-btn fl-btn-brand',
+            disabled: anyBench,
+            title: anyBench
+              ? 'A bench is already running. One queue per engine: wait for it to finish.'
+              : 'Run the task-shaped probes against every endpoint and cache the measurements. Roughly 10–40 s per engine.',
+            onClick: () => onBench(null),
+          }, busy['bench:all'] === true ? 'Benching…' : 'Bench now')),
+        fleet.enginesError ? h('div', { className: 'fl-err' }, fleet.enginesError) : null,
+        engines.length
+          ? h('table', { className: 'fl-table' },
+            h('thead', null, h('tr', null,
+              h('th', null, 'Engine · model'), h('th', null, 'Host'), h('th', null, 'Context'),
+              h('th', null, 'Reasoning levels'), h('th', null, 'Key'), h('th', null, 'Speed'),
+              h('th', null, 'Probe scores'), h('th', null, 'Action'))),
+            h('tbody', null, engines.map((engine, index) => {
+              const name = str(engine && engine.engine) || `engine-${index + 1}`
+              const model = str(engine && engine.model)
+              const measured = obj(engine && engine.measured)
+              const rate = asNumber(measured && measured.tokPerSec)
+              const ttft = asNumber(measured && measured.ttftMs)
+              const contextWindow = asNumber(engine && engine.contextWindow)
+              const efforts = arr(engine && engine.reasoningEfforts).map(str).filter(Boolean)
+              const keySet = engine && engine.hasKey === true
+              const rowBusy = busy[`bench:${name}`] === true || busy['bench:all'] === true
+              const speedTip = measured
+                ? [
+                  `time to first token ${ttft === null ? 'not reported' : fmtDuration(ttft)}`,
+                  measured.probeTokens === undefined ? '' : `${str(measured.probeTokens)} probe tokens`,
+                  measured.at === undefined ? '' : `measured ${fmtClock(measured.at)}`,
+                ].filter(Boolean).join(' · ')
+                : 'This engine has no measurement yet. Bench now runs the three task-shaped probes.'
+              return h('tr', { key: `${name}:${model || index}` },
+                h('td', null,
+                  h('div', { className: 'fl-label' }, fmtText(engine && engine.label, `${name}${model ? ` · ${model}` : ''}`)),
+                  h('div', { className: 'fl-mono fl-muted' }, [name, model || 'no model', str(engine.api)].filter(Boolean).join(' · '))),
+                h('td', null,
+                  fmtText(engine && engine.host, 'host not reported'),
+                  engine && engine.local === true ? h('div', { className: 'fl-muted' }, 'this machine') : null),
+                h('td', { className: 'fl-num' }, contextWindow === null ? 'not declared' : String(contextWindow)),
+                h('td', null, efforts.length ? efforts.join(' / ') : 'none declared'),
+                h('td', {
+                  className: 'fl-muted',
+                  title: keySet
+                    ? 'The Host holds a key for this endpoint. Its value is never sent to this page.'
+                    : 'No key is configured for this endpoint.',
+                }, keySet ? 'key set' : 'no key'),
+                h('td', { className: 'fl-num', title: speedTip },
+                  rate === null ? h('span', { className: 'fl-chip-none' }, 'unmeasured') : `${fmtRate(rate)} tok/s`),
+                h('td', null, h('div', { className: 'fl-chipbar' },
+                  ...scoreKinds(engine).map((kind) => h(ProbeChip, { key: kind, engine, kind })))),
+                h('td', null, h('div', { className: 'fl-actions' },
+                  h('button', {
+                    className: 'fl-btn fl-btn-sm', disabled: rowBusy,
+                    title: `Re-probe ${name}${model ? ` on ${model}` : ''} with the task-shaped probes.`,
+                    onClick: () => onBench(name),
+                  }, rowBusy ? 'Benching…' : 'Bench'))))
+            })))
+          : h('div', { className: 'fl-empty' }, 'No engines reported yet. An engine is a provider row plus one of its models, so give a provider at least one model first.'))
+    }
+
+    function RunsPanel({ runs, error, onOpen }) {
+      return h('div', { className: 'fl-panel' },
+        h('div', { className: 'fl-panel-head' }, 'Runs',
+          h('div', { className: 'fl-sub' }, 'fleet dispatches recorded by the Host, newest first, up to 30')),
+        error ? h('div', { className: 'fl-err' }, error) : null,
+        runs.length
+          ? h('table', { className: 'fl-table' },
+            h('thead', null, h('tr', null,
+              h('th', null, 'Run'), h('th', null, 'Task class'), h('th', null, 'Chunks'),
+              h('th', null, 'Wall clock'), h('th', null, 'Engines'))),
+            h('tbody', null, runs.map((run, index) => {
+              const runId = str(run && run.runId) || `run-${index + 1}`
+              const done = asNumber(run && run.done)
+              const chunks = asNumber(run && run.chunks)
+              const enginesCell = Array.isArray(run && run.engines)
+                ? (run.engines.length
+                  ? (run.engines.map((entry) => str(entry && entry.engine) || str(entry)).filter(Boolean).join(', ') || `${run.engines.length} engines`)
+                  : 'none')
+                : run && run.engines === undefined ? '—' : `${str(run.engines)} engine${Number(run.engines) === 1 ? '' : 's'}`
+              return h('tr', { key: runId },
+                h('td', null,
+                  h('button', {
+                    className: 'fl-row-btn', title: `Open ${runId}`,
+                    onClick: () => onOpen(runId),
+                  }, fmtText(run && run.title, runId)),
+                  h('div', { className: 'fl-mono fl-muted' }, runId)),
+                h('td', { className: 'fl-muted' }, fmtText(run && run.taskClass, 'not reported')),
+                h('td', { className: 'fl-num' },
+                  done === null && chunks === null ? '—' : `${done === null ? '?' : done}/${chunks === null ? '?' : chunks}`),
+                h('td', { className: 'fl-num' }, fmtDuration(run && run.wallClockMs) || '—'),
+                h('td', { className: 'fl-muted' }, enginesCell))
+            })))
+          : h('div', { className: 'fl-empty' }, 'No fleet runs recorded yet. The agent plans a split and asks you before it dispatches one.'))
+    }
+
+    function RunDrawer({ run, onClose }) {
+      const runId = str(run && run.runId)
+      const [view, setView] = useState(null)
+      const [error, setError] = useState('')
+      const [nonce, setNonce] = useState(0)
+
+      useEffect(() => {
+        const controller = new AbortController()
+        let alive = true
+        const load = async () => {
+          const result = await requestJson({ method: 'POST', path: ROUTES.runView, body: { id: runId }, signal: controller.signal })
+          if (!alive || result.aborted) return
+          if (!result.ok) {
+            setError(result.error)
+            return
+          }
+          setError('')
+          setView(obj(result.data && result.data.run))
+        }
+        void load()
+        return () => {
+          alive = false
+          controller.abort()
+        }
+      }, [runId, nonce])
+
+      const chunks = arr(view && view.chunks)
+      const rollup = engineRollup(view)
+      const estimate = obj(view && view.estimate)
+
+      return h(Drawer, {
+        title: fmtText(view && view.title, fmtText(run && run.title, 'Fleet run')),
+        subtitle: runId,
+        onClose,
+        footer: [
+          h('button', { key: 'r', className: 'fl-btn', onClick: () => setNonce((value) => value + 1) }, 'Reload run record'),
+          h('div', { key: 's', className: 'fl-spacer' }),
+          h('div', { key: 'n', className: 'fl-sub' }, view ? `${chunks.length} chunk${chunks.length === 1 ? '' : 's'}` : 'Reading…'),
+        ],
+      },
+        error ? h('div', { className: 'fl-err' }, error) : null,
+        view === null && !error ? h('div', { className: 'fl-empty' }, 'Reading the run record…') : null,
+        view ? h('div', { className: 'fl-kv' },
+          h('div', null, [
+            fmtText(view.taskClass, 'task class not reported'),
+            view.startedAt === undefined ? '' : `started ${fmtClock(view.startedAt)}`,
+            view.wallClockMs === undefined ? '' : `wall clock ${fmtDuration(view.wallClockMs)}`,
+          ].filter(Boolean).join(' · ')),
+          str(view.dir) ? h('div', { className: 'fl-mono' }, view.dir) : h('div', { className: 'fl-muted' }, 'No run directory reported by the Host.'),
+          estimate ? h('div', null, [
+            estimate.chunks === undefined ? '' : `${str(estimate.chunks)} chunks`,
+            estimate.soloMs === undefined ? '' : `solo ${fmtDuration(estimate.soloMs)}`,
+            estimate.fleetMs === undefined ? '' : `fleet ${fmtDuration(estimate.fleetMs)}`,
+            estimate.speedup === undefined ? '' : `speedup ${str(estimate.speedup)}×`,
+            estimate.recommendSplit === undefined ? '' : `split recommended: ${String(estimate.recommendSplit)}`,
+            estimate.estimateQuality === undefined ? '' : `estimate quality ${str(estimate.estimateQuality)}`,
+            estimate.unmeasured === undefined ? '' : `unmeasured engines: ${str(estimate.unmeasured)}`,
+          ].filter(Boolean).join(' · ')) : null) : null,
+
+        view ? h('div', { className: 'fl-note' },
+          'The Host enforces the split gate: the agent must ask first, and every chunk comes back as an artifact. No other machine writes to this working tree.') : null,
+
+        view && rollup.length
+          ? h('div', { className: 'fl-panel' },
+            h('div', { className: 'fl-panel-head' }, 'What each computer did'),
+            h('table', { className: 'fl-table' },
+              h('thead', null, h('tr', null,
+                h('th', null, 'Engine'), h('th', null, 'Host'), h('th', null, 'Model'),
+                h('th', null, 'Chunks'), h('th', null, 'Done'), h('th', null, 'Failed'),
+                h('th', null, 'Busy'), h('th', null, 'tok/s'), h('th', null, 'Graded'), h('th', null, 'Tokens out'))),
+              h('tbody', null, rollup.map((row, index) => {
+                const average = row.rates && row.rates.length
+                  ? row.rates.reduce((sum, value) => sum + value, 0) / row.rates.length
+                  : null
+                const rate = row.rate === null || row.rate === undefined ? average : row.rate
+                const busyTip = row.derived
+                  ? 'Busy time is the sum of this engine’s chunk wall clocks: the Host did not report busyMs for this run.'
+                  : 'Busy time as reported by the Host.'
+                const gradedTip = row.derived
+                  ? 'Graded pass counted from the chunk verdicts in the payload.'
+                  : 'Graded counts as reported by the Host.'
+                return h('tr', { key: `${row.engine}:${index}` },
+                  h('td', { className: 'fl-mono' }, row.engine),
+                  h('td', { className: 'fl-muted' }, row.host || '—'),
+                  h('td', { className: 'fl-muted' }, row.model || '—'),
+                  h('td', { className: 'fl-num' }, row.chunkCount === null || row.chunkCount === undefined ? '—' : String(row.chunkCount)),
+                  h('td', { className: 'fl-num' }, row.done === null ? '—' : String(row.done)),
+                  h('td', { className: row.failed ? 'fl-num fl-line-error' : 'fl-num' }, row.failed === null ? '—' : String(row.failed)),
+                  h('td', { className: 'fl-num', title: busyTip }, fmtDuration(row.busyMs) || '—'),
+                  h('td', { className: 'fl-num' }, rate === null ? '—' : fmtRate(rate)),
+                  h('td', { title: gradedTip },
+                    row.gradedTotal ? `${row.gradedPass || 0}/${row.gradedTotal} pass`
+                      : row.gradedPass === null || row.gradedTotal === null ? 'not reported' : 'not graded'),
+                  h('td', { className: 'fl-num' }, row.outputTokens === null ? '—' : String(row.outputTokens)))
+              }))))
+          : null,
+
+        view && chunks.length
+          ? h('div', { className: 'fl-section' }, ...chunks.map((chunk, index) => {
+            const verdict = obj(chunk && chunk.verdict)
+            const status = str(chunk && chunk.status)
+            const lowered = status.toLowerCase()
+            const statusClass = DONE_STATUSES.indexOf(lowered) >= 0 ? 'fl-chip fl-chip-pass'
+              : (FAILED_STATUSES.indexOf(lowered) >= 0 || (chunk && chunk.timedOut === true)) ? 'fl-chip fl-chip-fail'
+                : 'fl-chip fl-chip-none'
+            const timings = [
+              chunk.wallClockMs === undefined ? '' : `wall ${fmtDuration(chunk.wallClockMs)}`,
+              chunk.tokPerSec === undefined ? '' : `${fmtRate(chunk.tokPerSec)} tok/s`,
+              chunk.outputTokens === undefined ? '' : `${str(chunk.outputTokens)} tokens out`,
+              chunk.inputTokens === undefined ? '' : `${str(chunk.inputTokens)} in`,
+            ].filter(Boolean).join(' · ')
+            return h('div', {
+              className: 'fl-card', key: `${str(chunk && chunk.id) || 'chunk'}:${index}`,
+            },
+              h('div', { className: 'fl-card-head' },
+                h('span', { className: 'fl-label' }, fmtText(chunk && chunk.title, `chunk ${fmtText(chunk && chunk.id, String(index + 1))}`)),
+                h('span', { className: 'fl-chip fl-chip-none' }, fmtText(chunk && chunk.role, 'no role reported')),
+                h('span', { className: statusClass }, status || 'no status reported'),
+                chunk && chunk.timedOut === true ? h('span', { className: 'fl-chip fl-chip-fail' }, 'timed out') : null,
+                h('span', { className: 'fl-spacer' }),
+                h('span', { className: 'fl-mono fl-muted' }, [str(chunk && chunk.engine), str(chunk && chunk.host), str(chunk && chunk.model)].filter(Boolean).join(' · ') || 'no assignment reported')),
+              str(chunk && chunk.error) ? h('div', { className: 'fl-line-error' }, str(chunk.error)) : null,
+              !verdict
+                ? h('div', { className: 'fl-muted' }, 'No verdict reported for this chunk.')
+                : verdict.graded !== true
+                  ? h('div', { className: 'fl-muted' }, `Not graded${str(verdict.why) ? `: ${str(verdict.why)}` : '.'}`)
+                  : h('div', { className: verdict.pass === true ? 'fl-ok' : 'fl-line-error' },
+                    `${verdict.pass === true ? 'Graded pass' : 'Graded fail'}${str(verdict.why) ? `: ${str(verdict.why)}` : ''}`),
+              timings ? h('div', { className: 'fl-muted' }, timings) : h('div', { className: 'fl-muted' }, 'No timings reported.'),
+              Array.isArray(chunk && chunk.writes)
+                ? h('div', { className: 'fl-muted' }, chunk.writes.length
+                  ? `Declared write scopes: ${chunk.writes.map(str).filter(Boolean).join(', ')}`
+                  : 'No write scopes declared.')
+                : null,
+              str(chunk && chunk.preview)
+                ? h('div', { className: 'fl-logbox fl-preview', title: 'Text returned by the machine that ran this chunk. Artifacts only: nothing here was written to this working tree.' }, str(chunk.preview))
+                : h('div', { className: 'fl-muted' }, 'No preview text returned.'),
+              h('div', { className: 'fl-mono fl-muted' }, str(chunk && chunk.artifact) ? `Artifact: ${str(chunk.artifact)}` : 'No artifact path reported.'))
+          }))
+          : null,
+        view && !chunks.length ? h('div', { className: 'fl-empty' }, 'This run record carries no chunks, so there is nothing to show.') : null,
+      )
+    }
+
     // ---------- page ----------
     function Page() {
-      const { data, error, loading, fetchedAt } = useFleetStore('page')
+      const { data, error, loading, fetchedAt, engines, enginesError, runs, runsError, orchestrationMissing } = useFleetStore('page')
       const [busy, setBusy] = useState({})
       const [flash, setFlash] = useState(null)
       const [savedWarnings, setSavedWarnings] = useState([])
@@ -1050,6 +1507,8 @@ window.__ModuleLoader__.load({
       const launcher = obj(data && data.launcher)
       const defaults = obj(data && data.defaults) || {}
       const hostWarnings = arr(data && data.warnings).map(str).filter(Boolean)
+      const fleet = { engines, enginesError, orchestrationMissing }
+      const runList = arr(runs)
 
       const callAction = async (action, id, key) => {
         markBusy(key, true)
@@ -1089,6 +1548,36 @@ window.__ModuleLoader__.load({
           : exit === 0
             ? 'CLI install finished with exit 0; the launcher status was re-read.'
             : `The installer exited with code ${exit}; the launcher status was re-read.`)
+        void refresh()
+      }
+
+      // Bench grades the engines with the Host's task-shaped probes. It is slow by
+      // design, so the busy flag covers the whole request and the engine catalog is
+      // re-read when it lands.
+      const bench = async (engine) => {
+        const key = engine ? `bench:${engine}` : 'bench:all'
+        markBusy(key, true)
+        const result = await requestJson({
+          method: 'POST',
+          path: ROUTES.bench,
+          body: engine ? { engine, rebench: true } : {},
+          signal: signal(),
+        })
+        markBusy(key, false)
+        if (result.aborted) return
+        if (!result.ok) {
+          showFlash('error', `Bench failed: ${result.error}`)
+          void refresh()
+          return
+        }
+        const rows = Array.isArray(result.data && result.data.bench) ? result.data.bench : null
+        const note = str(result.data && result.data.note)
+        if (rows === null) {
+          showFlash('ok', `Bench accepted.${note ? ` ${note}` : ''}`)
+        } else {
+          const passed = rows.filter((row) => row && row.passed === true).length
+          showFlash('ok', `Bench done: ${rows.length} model${rows.length === 1 ? '' : 's'} probed, ${passed} passed.${note ? ` ${note}` : ''}`)
+        }
         void refresh()
       }
 
@@ -1241,6 +1730,13 @@ window.__ModuleLoader__.load({
             saving,
             onClose: closeDrawer,
             onSubmit: (registry) => { void saveProvider(registry) },
+          })
+        }
+        if (drawer.kind === 'run') {
+          return h(RunDrawer, {
+            key: `run:${drawer.id}`,
+            run: { runId: drawer.id },
+            onClose: closeDrawer,
           })
         }
         return null
@@ -1496,6 +1992,37 @@ window.__ModuleLoader__.load({
                     }, 'Delete'))))
               })))
             : h('div', { className: 'fl-empty' }, 'No providers yet. Add one per LLM box so instances can pick a default model from it.')),
+
+        h('div', { className: 'fl-section' },
+          h('div', { className: 'fl-section-head' }, 'Engines & runs'),
+          h('div', { className: 'fl-note' },
+            'The split is opt-in: the agent has to ask you before it fans a task out across machines, and chunks come back as artifacts only — no other machine writes to this working tree.'),
+          orchestrationMissing
+            ? h('div', { className: 'fl-panel' },
+              h('div', { className: 'fl-panel-head' }, 'Engines'),
+              h('div', { className: 'fl-empty' },
+                h('span', null, 'This install has no orchestration yet: the Host does not serve /fleet/api/engines.'),
+                ' ',
+                h('button', {
+                  className: 'fl-btn fl-btn-sm',
+                  title: 'Read the orchestration routes once more, for example after updating this bundle.',
+                  onClick: () => { void refresh({ recheckOrchestration: true }) },
+                }, 'Re-check')))
+            : [
+              h(EnginesPanel, {
+                key: 'engines',
+                fleet,
+                busy,
+                onBench: (engine) => { void bench(engine) },
+                onRecheck: () => { void refresh({ recheckOrchestration: true }) },
+              }),
+              h(RunsPanel, {
+                key: 'runs',
+                runs: runList,
+                error: runsError,
+                onOpen: (runId) => setDrawer({ kind: 'run', id: runId }),
+              }),
+            ]),
 
         drawerNode)
     }

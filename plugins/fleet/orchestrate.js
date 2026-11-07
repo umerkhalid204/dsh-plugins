@@ -1,0 +1,690 @@
+/*
+ * Fleet orchestration (R1: direct engine fan-out).
+ *
+ * A computer does not have to run DSH to take part. What gets scheduled is an
+ * *engine* — an OpenAI-compatible endpoint (Strata, llama.cpp, LM Studio,
+ * Ollama, vLLM…) that any machine can host. DSH `instances` stay what they
+ * always were: interactive seats. So: brains are borrowed from every box,
+ * files never leave this Host, and each chunk comes back as an artifact
+ * (JSON / text / diff) that the agent applies here.
+ *
+ * Division of labour, deliberately:
+ *   - the agent (a language model) writes the chunk DAG — semantics;
+ *   - this module validates it, measures engines, schedules, enforces the
+ *     split gate, runs the fan-out, and always produces the per-computer
+ *     summary. No heuristic here decides what a chunk means.
+ */
+
+const DEFAULTS = {
+  contextFill: 0.6,
+  fallbackContextWindow: 8192,
+  fallbackTokPerSec: 15,
+  perEngineConcurrency: 1,
+  chunkWallClockMs: 240000,
+  chunkOutputTokens: 800,
+  benchTtlHours: 24,
+}
+
+/* --------------------------------------------------------------- estimation */
+
+/** Crude, but self-correcting: real usage.prompt_tokens recalibrates per engine. */
+function estimateTokens(text) {
+  const s = String(text ?? '')
+  const cjk = (s.match(/[\u3040-\u30ff\u3400-\u4dbf\uac00-\ud7af\u4e00-\u9fff]/gu) ?? []).length
+  return Math.ceil((s.length - cjk) / 3.6 + cjk / 1.1)
+}
+
+function estimateMessages(messages) {
+  return messages.reduce((sum, m) => sum + estimateTokens(m?.content) + 4, 8)
+}
+
+/* ------------------------------------------------------------- grading (local) */
+
+function grade(text, expects) {
+  if (!expects || typeof expects !== 'object') return { graded: false }
+  const kind = String(expects.kind ?? '')
+  const body = String(text ?? '')
+  if (kind === 'jsonKeys') {
+    let parsed
+    try {
+      parsed = JSON.parse(body.replace(/^```(?:json)?\s*|\s*```$/gu, ''))
+    } catch (error) {
+      return { graded: true, pass: false, why: `not parseable JSON (${error.message})` }
+    }
+    const want = Array.isArray(expects.keys) ? expects.keys : []
+    const missing = want.filter((key) => !(parsed && typeof parsed === 'object' && key in parsed))
+    return { graded: true, pass: missing.length === 0, why: missing.length ? `missing keys: ${missing.join(', ')}` : `${want.length} keys present`, parsed }
+  }
+  if (kind === 'contains') {
+    const want = Array.isArray(expects.values) ? expects.values : []
+    const missing = want.filter((needle) => !body.includes(String(needle)))
+    return { graded: true, pass: missing.length === 0, coverage: `${want.length - missing.length}/${want.length}`, why: missing.length ? `absent: ${missing.slice(0, 8).join(', ')}` : 'all present' }
+  }
+  if (kind === 'regex') {
+    try {
+      const re = new RegExp(String(expects.pattern), String(expects.flags ?? ''))
+      return { graded: true, pass: re.test(body), why: re.test(body) ? 'matched' : 'no match' }
+    } catch {
+      return { graded: true, pass: false, why: 'bad pattern' }
+    }
+  }
+  if (kind === 'numberEquals') {
+    const found = (body.match(/-?\d+(\.\d+)?/gu) ?? []).map(Number)
+    const hit = found.some((n) => Math.abs(n - Number(expects.value)) <= Number(expects.tolerance ?? 0))
+    return { graded: true, pass: hit, why: hit ? `found ${expects.value}` : `not in ${found.slice(0, 6).join(', ')}` }
+  }
+  return { graded: false, why: `unknown expects.kind "${kind}"` }
+}
+
+/* ------------------------------------------------------------ the orchestrator */
+
+export function createOrchestrator(deps) {
+  const { registry, resolveKey, paths, limits = {}, now = () => Date.now() } = deps
+  const runsDir = paths.runs
+  const cachePath = paths.benchCache
+  const opt = {
+    ...DEFAULTS,
+    ...limits,
+    contextFill: Number.isFinite(limits.contextFillPercent) ? limits.contextFillPercent / 100 : DEFAULTS.contextFill,
+    minSpeedup: Number.isFinite(limits.minSpeedupPercent) ? limits.minSpeedupPercent / 100 : 1.4,
+  }
+
+  const { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } = deps.fs
+  const dirName = deps.path?.dirname ?? ((file) => String(file).split('/').slice(0, -1).join('/'))
+
+  function load(file, fallback) {
+    try {
+      return JSON.parse(readFileSync(file, 'utf8'))
+    } catch {
+      return fallback
+    }
+  }
+  function save(file, value) {
+    mkdirSync(dirName(file), { recursive: true })
+    writeFileSync(file, JSON.stringify(value, null, 2))
+  }
+  function ensureDir(dir) {
+    mkdirSync(dir, { recursive: true })
+  }
+
+  function providersByName() {
+    const reg = registry() ?? { providers: [], instances: [] }
+    const map = new Map()
+    for (const provider of reg.providers) if (provider?.name) map.set(provider.name, provider)
+    return map
+  }
+
+  function modelOf(provider, id) {
+    return (provider?.models ?? []).find((m) => m.id === id || m.id === id.split('/').pop()) ?? null
+  }
+
+  async function keyFor(provider) {
+    if (provider?.apiKey) return provider.apiKey
+    if (provider?.apiKeyRef) return await resolveKey(provider.apiKeyRef)
+    return undefined
+  }
+
+  function benchCache() {
+    return load(cachePath, { rows: {} })
+  }
+
+  /** Capability fingerprint for every engine, merged with any measured numbers. */
+  async function engines() {
+    const cache = benchCache()
+    const rows = []
+    for (const provider of providersByName().values()) {
+      const key = await keyFor(provider)
+      for (const model of provider.models ?? []) {
+        const stamp = cache.rows[`${provider.name}::${model.id}`]
+        rows.push({
+          engine: provider.name,
+          host: authorityOfUrl(provider.baseURL),
+          api: provider.api,
+          model: model.id,
+          label: model.name ?? model.id,
+          contextWindow: model.contextWindow ?? null,
+          maxTokens: model.maxTokens ?? null,
+          reasoningEfforts: model.reasoningEfforts ?? null,
+          hasKey: Boolean(key),
+          local: isLocalAuthority(authorityOfUrl(provider.baseURL)),
+          measured: stamp
+            ? { tokPerSec: stamp.tokPerSec, ttftMs: stamp.ttftMs ?? null, at: stamp.at, scores: stamp.scores ?? {}, probeTokens: stamp.probeTokens ?? null }
+            : null,
+        })
+      }
+    }
+    return { ok: true, engines: rows, cacheAgeHours: ageHours(rows.filter((r) => r.measured).map((r) => r.measured.at), now()), limits: opt }
+  }
+
+  /* ------------------------------------------------------------- one request */
+
+  async function chat({ provider, model, messages, maxTokens, temperature = 0.4, json = false, effort, timeoutMs }) {
+    const base = String(provider.baseURL ?? '').trim().replace(/\/+$/u, '')
+    if (!base) return { ok: false, error: `provider "${provider.name}" has no baseURL` }
+    const key = await keyFor(provider)
+    const cap = Math.min(Number(maxTokens) || opt.chunkOutputTokens, Number(model?.maxTokens) || Number(maxTokens) || opt.chunkOutputTokens)
+    const started = now()
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), Number(timeoutMs) || opt.chunkWallClockMs)
+    let request
+    if (provider.api === 'anthropic-messages') {
+      const system = messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n')
+      request = {
+        url: `${base}/messages`,
+        headers: { 'content-type': 'application/json', ...(key ? { 'x-api-key': key } : {}), 'anthropic-version': '2023-06-01' },
+        body: { model: model?.id, max_tokens: cap, system: system || undefined, messages: messages.filter((m) => m.role !== 'system').map((m) => ({ role: m.role, content: String(m.content ?? '') })) },
+      }
+    } else if (provider.api === 'openai-responses') {
+      request = {
+        url: `${base}/responses`,
+        headers: { 'content-type': 'application/json', ...(key ? { authorization: `Bearer ${key}` } : {}) },
+        body: { model: model?.id, input: messages.map((m) => `${m.role}: ${String(m.content ?? '')}`).join('\n\n'), max_output_tokens: cap, ...(json ? { text: { format: { type: 'json_object' } } } : {}) },
+      }
+    } else {
+      request = {
+        url: `${base}/chat/completions`,
+        headers: { 'content-type': 'application/json', ...(key ? { authorization: `Bearer ${key}` } : {}) },
+        body: {
+          model: model?.id,
+          messages: messages.map((m) => ({ role: m.role === 'user' || m.role === 'system' || m.role === 'assistant' ? m.role : 'user', content: String(m.content ?? '') })),
+          max_tokens: cap,
+          temperature,
+          ...(json ? { response_format: { type: 'json_object' } } : {}),
+          ...(effort && model?.reasoningEfforts && model.reasoningEfforts !== false ? { reasoning_effort: effort } : {}),
+        },
+      }
+    }
+    try {
+      const response = await fetch(request.url, { method: 'POST', headers: request.headers, body: JSON.stringify(request.body), signal: controller.signal })
+      const raw = await response.text()
+      const elapsedMs = now() - started
+      if (!response.ok) return { ok: false, error: `HTTP ${response.status} ${response.statusText} — ${raw.slice(0, 300)}`, elapsedMs, url: request.url }
+      let data
+      try {
+        data = JSON.parse(raw)
+      } catch {
+        return { ok: false, error: `endpoint answered non-JSON: ${raw.slice(0, 200)}`, elapsedMs, url: request.url }
+      }
+      const text = extractText(data, provider.api)
+      const reasoning = extractReasoning(data)
+      const usage = data?.usage ?? data?.usage_metadata ?? {}
+      const completionTokens = Number(usage.completion_tokens ?? usage.output_tokens ?? usage.outputTokens) || estimateTokens(text)
+      const promptTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? usage.inputTokens) || null
+      const finish = data?.choices?.[0]?.finish_reason ?? data?.stop_reason ?? null
+      return {
+        ok: true,
+        text,
+        ...(reasoning ? { reasoning } : {}),
+        elapsedMs,
+        completionTokens,
+        reasoningTokens: reasoning ? estimateTokens(reasoning) : 0,
+        promptTokens,
+        tokPerSec: completionTokens > 0 ? round2((completionTokens / Math.max(1, elapsedMs)) * 1000) : null,
+        url: request.url,
+        finish,
+        // Reasoning-first packs (Strata's chat API puts thinking in
+        // `reasoning_content` and leaves `content` null until it is done): with
+        // a tight budget the answer never lands. Say so instead of grading "".
+        ...(finish === 'length' && !text ? { starved: true } : {}),
+      }
+    } catch (error) {
+      return { ok: false, error: String(error?.message ?? error), elapsedMs: now() - started, url: request.url, aborted: controller.signal.aborted }
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  function extractReasoning(data) {
+    const candidate = data?.choices?.[0]?.message?.reasoning_content ?? data?.choices?.[0]?.reasoning_content ?? data?.reasoning
+    return typeof candidate === 'string' && candidate.trim() ? candidate : ''
+  }
+
+  function extractText(data, api) {
+    if (api === 'openai-responses') {
+      if (typeof data?.output_text === 'string') return data.output_text
+      const parts = (data?.output ?? []).flatMap((item) => (Array.isArray(item?.content) ? item.content : []))
+      return parts.map((part) => part?.text ?? '').join('')
+    }
+    if (api === 'anthropic-messages') return (data?.content ?? []).map((part) => part?.text ?? '').join('')
+    return data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? ''
+  }
+
+  /* --------------------------------------------------------------- capability */
+
+  const PROBE_ITEMS = [
+    {
+      kind: 'constraint',
+      label: 'output discipline',
+      messages: [{ role: 'user', content: 'Reply with ONLY this JSON object, no prose, no code fence: {"name":"<the word fleet>","count":3,"items":["a","b","c"]}' }],
+      maxTokens: 80,
+      expects: { kind: 'jsonKeys', keys: ['name', 'count', 'items'] },
+    },
+    {
+      kind: 'coverage',
+      label: 'enumeration coverage',
+      messages: [
+        { role: 'user', content: 'List every distinct port number mentioned below, as a JSON object {"ports":[...]}, no prose. Ports appear in these lines:\n  box-3090 :3101 running pid 3877 (default strata-rtx3090/iq3_s, effort high), box-107 :3102 running pid 3874 (default strata-107/iq3_xxs, no effort), box-mac :3103 running pid 12401; the Host itself sits on http://127.0.0.1:50658 and Ollama would be 127.0.0.1:11434.' },
+      ],
+      maxTokens: 120,
+      expects: { kind: 'contains', values: ['3101', '3102', '3103', '50658'] },
+    },
+    {
+      kind: 'grounding',
+      label: 'reads what it is shipped',
+      messages: [
+        { role: 'user', content: 'Read this excerpt and answer with ONLY {"ratio":"<x>"} where x is the numeric threshold for offering a split:\n"Amdahl honesty. Plugin computes critical path vs total work and the estimated makespan per candidate schedule. Default rule: only offer the split when estMakespan ≤ 0.7 × soloEstimate."' },
+      ],
+      maxTokens: 80,
+      expects: { kind: 'contains', values: ['0.7'] },
+    },
+  ]
+
+  async function bench({ items, engine, rebench = false, concurrency = 1 } = {}) {
+    const probeItems = Array.isArray(items) && items.length ? items : PROBE_ITEMS
+    const cache = benchCache()
+    const fresh = rebench || ageHours([cache.at], now()) > opt.benchTtlHours
+    const index = providersByName()
+    const wanted = [...index.values()].filter((p) => (engine ? p.name === engine : true))
+    if (!wanted.length) return { ok: false, error: engine ? `no engine "${engine}" in the registry` : 'the registry has no providers to bench' }
+    const results = []
+    for (const provider of wanted) {
+      const models = provider.models ?? []
+      if (!models.length) {
+        results.push({ engine: provider.name, skipped: 'no models declared' })
+        continue
+      }
+      if (!fresh && cache.rows[`${provider.name}::${models[0].id}`]?.scores) {
+        results.push({ engine: provider.name, model: models[0].id, cached: true, ...cache.rows[`${provider.name}::${models[0].id}`] })
+        continue
+      }
+      const perModel = []
+      for (const model of models.slice(0, 2)) {
+        const scores = {}
+        let totalTokens = 0
+        let totalMs = 0
+        let passed = 0
+        for (const item of probeItems) {
+          // Reasoning-first packs spend most of the budget thinking, so a probe
+          // needs real headroom or it grades an empty answer. Never send
+          // reasoning_effort here: on these packs it is a 60 s+ path.
+          const outcome = await chat({ provider, model, messages: item.messages, maxTokens: Math.max(320, Number(item.maxTokens) || 380), temperature: 0, timeoutMs: Math.max(60000, Math.floor(opt.chunkWallClockMs / 3)) })
+          if (!outcome.ok) {
+            scores[item.kind] = { pass: false, why: outcome.error, score: 0 }
+            continue
+          }
+          if (outcome.starved) {
+            scores[item.kind] = { pass: false, why: `thinking consumed the budget (${outcome.reasoningTokens ?? '?'} reasoning tokens, finish=length, no content) — raise maxTokens`, score: 1, ms: outcome.elapsedMs, tokPerSec: outcome.tokPerSec }
+            continue
+          }
+          const verdict = grade(outcome.text, item.expects)
+          totalTokens += outcome.completionTokens
+          totalMs += outcome.elapsedMs
+          if (verdict.pass) passed += 1
+          scores[item.kind] = { pass: Boolean(verdict.pass), why: verdict.why, score: verdict.pass ? 10 : 2, ms: outcome.elapsedMs, tokPerSec: outcome.tokPerSec }
+        }
+        const row = {
+          engine: provider.name,
+          model: model.id,
+          at: now(),
+          scores,
+          passed,
+          probed: probeItems.length,
+          tokPerSec: totalMs > 0 ? round2((totalTokens / totalMs) * 1000) : null,
+          probeTokens: totalTokens,
+        }
+        perModel.push(row)
+        cache.rows[`${provider.name}::${model.id}`] = row
+      }
+      results.push(...perModel)
+    }
+    cache.at = now()
+    save(cachePath, cache)
+    return { ok: true, bench: results, note: 'Graded locally (parse/contains), never by a model. tok/s decides chunk size; scores decide role.' }
+  }
+
+  /* ------------------------------------------------------------------ plan / gate */
+
+  function bestEngine(rows) {
+    const ranked = rows.filter((r) => r.measured?.tokPerSec).sort((a, b) => b.measured.tokPerSec - a.measured.tokPerSec)
+    return ranked[0] ?? rows[0] ?? null
+  }
+
+  function validate(chunks) {
+    const index = providersByName()
+    const errors = []
+    const warnings = []
+    const seen = new Set()
+    const writers = new Map()
+    for (const chunk of chunks) {
+      if (!chunk?.id) errors.push('a chunk is missing an id')
+      if (seen.has(chunk.id)) errors.push(`duplicate chunk id "${chunk.id}"`)
+      seen.add(chunk.id)
+      if (!chunk?.prompt && !Array.isArray(chunk?.messages)) errors.push(`chunk "${chunk.id}" has no prompt/messages`)
+      const provider = index.get(chunk?.engine)
+      if (!provider) {
+        errors.push(`chunk "${chunk.id}" names engine "${chunk?.engine}", which the registry does not define`)
+        continue
+      }
+      const model = modelOf(provider, chunk?.model ?? provider.models?.[0]?.id)
+      if (!model) errors.push(`chunk "${chunk.id}" names model "${chunk?.model}", not in engine "${chunk.engine}"'s list`)
+      const key = provider.apiKey || provider.apiKeyRef
+      if (!key) warnings.push(`engine "${provider.name}" declares no apiKey/apiKeyRef — the call will be unauthenticated`)
+      const messages = Array.isArray(chunk.messages) ? chunk.messages : [{ role: 'user', content: chunk.prompt }]
+      const estInput = estimateMessages(messages)
+      const window = model?.contextWindow ?? opt.fallbackContextWindow
+      const maxInput = Math.floor(window * opt.contextFill)
+      const estOutput = Number(chunk.maxTokens) || opt.chunkOutputTokens
+      if (estInput + estOutput > window) errors.push(`chunk "${chunk.id}" needs ~${estInput}+${estOutput} tokens but engine "${provider.name}" advertises a ${window} window — re-cut the chunk smaller or move it to a bigger window`)
+      else if (estInput > maxInput) warnings.push(`chunk "${chunk.id}" ships ~${estInput} tokens, over ${Math.round(opt.contextFill * 100)}% of "${provider.name}"'s ${window} window — trim the brief (only the files that chunk touches)`)
+      for (const file of chunk.writes ?? []) {
+        if (writers.has(file)) errors.push(`two chunks write "${file}" (${writers.get(file)} and ${chunk.id}) — disjoint write scopes are required`)
+        else writers.set(file, chunk.id)
+      }
+    }
+    return { errors, warnings }
+  }
+
+  function estimateSchedule(chunks) {
+    const rows = []
+    const index = providersByName()
+    for (const chunk of chunks) {
+      const provider = index.get(chunk.engine)
+      const model = modelOf(provider, chunk.model ?? provider?.models?.[0]?.id)
+      const stamp = benchCache().rows[`${chunk.engine}::${model?.id}`]
+      const tokPerSec = stamp?.tokPerSec ?? opt.fallbackTokPerSec
+      const output = Number(chunk.maxTokens) || opt.chunkOutputTokens
+      const messages = Array.isArray(chunk.messages) ? chunk.messages : [{ role: 'user', content: chunk.prompt }]
+      const input = estimateMessages(messages)
+      // prefill is charged at a conservative fraction of decode throughput.
+      const ms = Math.round((output / tokPerSec) * 1000 + (input / (tokPerSec * 0.35)) * 1000)
+      rows.push({ id: chunk.id, engine: chunk.engine, model: model?.id ?? chunk.model, input, output, tokPerSec, measured: Boolean(stamp?.tokPerSec), estMs: ms })
+    }
+    const byEngine = new Map()
+    for (const row of rows) byEngine.set(row.engine, [...(byEngine.get(row.engine) ?? []), row])
+    const perEngineMs = [...byEngine.entries()].map(([engine, list]) => ({ engine, chunks: list.length, busyMs: list.reduce((sum, r) => sum + r.estMs, 0) }))
+    const fleetMs = Math.max(0, ...perEngineMs.map((r) => r.busyMs))
+    const totalMs = rows.reduce((sum, r) => sum + r.estMs, 0)
+    // Solo baseline = the single *best* box doing all the work, because that is
+    // what the human is actually choosing between. Summing the mixed assignment
+    // would flatter the split and hide a slow box sitting on the critical path.
+    const fastest = rows.some((r) => r.measured && r.tokPerSec) ? Math.max(...rows.filter((r) => r.measured).map((r) => r.tokPerSec)) : opt.fallbackTokPerSec
+    const soloMs = Math.round(rows.reduce((sum, r) => sum + r.estMs * (fastest > 0 && r.tokPerSec ? r.tokPerSec / fastest : 1), 0))
+    const unmeasured = rows.filter((r) => !r.measured).map((r) => r.id)
+    return {
+      chunks: rows,
+      perEngine: perEngineMs,
+      soloMs,
+      fleetMs,
+      speedup: fleetMs > 0 ? round2(soloMs / fleetMs) : null,
+      recommendSplit: fleetMs > 0 && soloMs / fleetMs >= (opt.minSpeedup ?? 1.4),
+      estimateQuality: unmeasured.length ? `unmeasured: ${unmeasured.join(', ')} (assumed ${opt.fallbackTokPerSec} tok/s — run bench first)` : 'measured',
+      unmeasured,
+    }
+  }
+
+  async function plan({ chunks, taskClass } = {}) {
+    if (!Array.isArray(chunks) || !chunks.length) return { ok: false, error: 'plan needs a chunks array' }
+    const { errors, warnings } = validate(chunks)
+    const estimate = estimateSchedule(chunks)
+    const fingerprint = await engines()
+    return {
+      ok: errors.length === 0,
+      taskClass: taskClass ?? null,
+      errors,
+      warnings,
+      estimate,
+      engines: fingerprint.engines.filter((row) => row.hasKey),
+      gateRule: `Split is offered when speedup ≥ ${opt.minSpeedup ?? 1.4}; below that the honest answer is Solo.`,
+      askUser: errors.length === 0 ? 'Present this estimate to the user and ask: Split / Solo / Adjust. Then call run with gate {asked:true, answer:"split"} only if they chose Split.' : 'Fix the errors, then plan again.',
+    }
+  }
+
+  /* --------------------------------------------------------------------- the run */
+
+  async function run({ chunks, title = 'fleet run', taskClass = null, gate, budget } = {}) {
+    if (!Array.isArray(chunks) || !chunks.length) return { ok: false, error: 'run needs a chunks array' }
+    // Requirement: the split is optional and must pause for the human. Enforced
+    // here, in the API, so no agent turn can skip the prompt.
+    if (!gate || gate.asked !== true || gate.answer !== 'split') {
+      return {
+        ok: false,
+        error: 'Refusing to dispatch: the fleet split is opt-in. Call plan first, then ask the user (Split / Solo / Adjust), then re-call run with gate: {asked:true, answer:"split", askedAt, note}.',
+        gate: gate ?? null,
+      }
+    }
+    const { errors, warnings } = validate(chunks)
+    if (errors.length) return { ok: false, error: 'plan did not validate', errors, warnings }
+    const estimate = estimateSchedule(chunks)
+    const runId = `${now()}-${String(title).toLowerCase().replace(/[^a-z0-9]+/gu, '-').slice(0, 40)}`
+    const dir = `${runsDir}/${runId}`
+    ensureDir(`${dir}/chunks`)
+    const index = providersByName()
+
+    // One queue per engine: a single consumer GPU does not scale with
+    // concurrency, so chunks on the same box serialise while boxes overlap.
+    const queues = new Map()
+    for (const chunk of chunks) queues.set(chunk.engine, [...(queues.get(chunk.engine) ?? []), chunk])
+
+    /* Reasoning-first packs spend most of the budget thinking and return an
+     * empty `content` when the cap cuts them off (`finish_reason: length`).
+     * That is not a capability failure, it is a budget failure, so the
+     * orchestrator escalates the budget once instead of grading a blank. */
+    async function chatWithBudget({ provider, model, chunk, messages, budget }) {
+      const first = await chat({
+        provider,
+        model,
+        messages,
+        maxTokens: chunk.maxTokens ?? opt.chunkOutputTokens,
+        temperature: chunk.temperature ?? 0.4,
+        json: false, // `response_format` is unproven on these packs; the prompt asks for JSON and grade() parses it.
+        effort: chunk.effort,
+        timeoutMs: Math.min(chunk.wallClockMs ?? budget?.chunkWallClockMs ?? opt.chunkWallClockMs, budget?.chunkWallClockMs ?? opt.chunkWallClockMs),
+      })
+      if (!first.starved || chunk.noEscalate) return first
+      const escalated = Math.min(
+        Math.max(2 * (chunk.maxTokens ?? opt.chunkOutputTokens), 1500),
+        Number(model?.maxTokens) || 4096,
+        chunk.maxTokensCeiling ?? 4096,
+      )
+      const second = await chat({
+        provider,
+        model,
+        messages,
+        maxTokens: escalated,
+        temperature: chunk.temperature ?? 0.4,
+        json: false,
+        effort: chunk.effort,
+        timeoutMs: Math.min(chunk.wallClockMs ?? budget?.chunkWallClockMs ?? opt.chunkWallClockMs, budget?.chunkWallClockMs ?? opt.chunkWallClockMs),
+      })
+      return { ...second, escalatedFrom: first.maxTokens ?? chunk.maxTokens ?? opt.chunkOutputTokens, firstElapsedMs: first.elapsedMs, attempts: 2 }
+    }
+
+    const started = now()
+    const record = { runId, title, taskClass, dir, startedAt: started, gate, warnings, estimate, engineConcurrency: opt.perEngineConcurrency, chunks: [] }
+    save(`${dir}/run.json`, record)
+
+    const perEngine = await Promise.all(
+      [...queues.entries()].map(async ([engineName, list]) => {
+        const provider = index.get(engineName)
+        const out = []
+        for (const chunk of list) {
+          const model = modelOf(provider, chunk.model ?? provider?.models?.[0]?.id)
+          const messages = Array.isArray(chunk.messages) ? chunk.messages : [{ role: 'user', content: chunk.prompt }]
+          const outcome = await chatWithBudget({ provider, model, chunk, messages, budget })
+          let verdict = outcome.ok ? grade(outcome.text, chunk.expects) : { graded: false }
+          if (outcome.starved) verdict = { graded: true, pass: false, why: `thinking consumed the token budget (${outcome.reasoningTokens ?? '?'} reasoning tokens, finish=length, content empty) — raise maxTokens for this engine` }
+          const row = {
+            id: chunk.id,
+            role: chunk.role ?? 'worker',
+            title: chunk.title ?? '',
+            engine: engineName,
+            host: authorityOfUrl(provider.baseURL),
+            model: model?.id ?? chunk.model ?? null,
+            status: outcome.ok ? 'done' : 'failed',
+            error: outcome.ok ? null : outcome.error,
+            timedOut: Boolean(outcome.aborted),
+            finish: outcome.finish ?? null,
+            starved: Boolean(outcome.starved),
+            attempts: outcome.attempts ?? 1,
+            escalatedFrom: outcome.escalatedFrom ?? null,
+            reasoningTokens: outcome.reasoningTokens ?? 0,
+            wallClockMs: outcome.elapsedMs ?? null,
+            inputTokens: outcome.promptTokens ?? estimateMessages(messages),
+            inputEstimateOnly: outcome.promptTokens == null,
+            outputTokens: outcome.completionTokens ?? null,
+            tokPerSec: outcome.tokPerSec ?? null,
+            verdict,
+            writes: chunk.writes ?? [],
+            preview: String((outcome.ok ? (outcome.text || outcome.reasoning || '') : (outcome.error ?? '')) ?? '').replace(/\s+/gu, ' ').slice(0, 240),
+            artifact: `${dir}/chunks/${chunk.id}.json`,
+          }
+          save(`${dir}/chunks/${chunk.id}.json`, { ...row, text: outcome.ok ? outcome.text : null, raw: outcome.ok ? null : outcome.error })
+          record.chunks.push(row)
+          save(`${dir}/run.json`, record)
+          out.push(row)
+        }
+        return out
+      }),
+    )
+
+    const finished = now()
+    const all = perEngine.flat()
+    record.finishedAt = finished
+    record.wallClockMs = finished - started
+    record.summary = summarise(all, estimate, finished - started)
+    save(`${dir}/run.json`, record)
+    const markdown = summaryMarkdown(record)
+    writeFileSync(`${dir}/SUMMARY.md`, markdown)
+
+    // Measured numbers feed the next estimate: the estimator calibrates itself.
+    const cache = benchCache()
+    for (const row of all) {
+      if (!row.tokPerSec) continue
+      const key = `${row.engine}::${row.model}`
+      cache.rows[key] = { ...(cache.rows[key] ?? {}), engine: row.engine, model: row.model, at: finished, tokPerSec: row.tokPerSec, runTokens: (cache.rows[key]?.runTokens ?? 0) + (row.outputTokens ?? 0) }
+    }
+    cache.calibration = { estimatedFleetMs: estimate.fleetMs, actualWallClockMs: finished - started, at: finished }
+    save(cachePath, cache)
+
+    return { ok: true, runId, dir, wallClockMs: finished - started, estimate: { ...estimate, actualWallClockMs: finished - started }, summary: record.summary, markdown, warnings }
+  }
+
+  function summarise(all, estimate, wallClockMs) {
+    const byEngine = new Map()
+    for (const row of all) {
+      const bucket = byEngine.get(row.engine) ?? { engine: row.engine, host: row.host, model: row.model, chunks: [], done: 0, failed: 0, outputTokens: 0, busyMs: 0, verdicts: 0, graded: 0 }
+      bucket.chunks.push({ id: row.id, role: row.role, title: row.title, status: row.status, tokPerSec: row.tokPerSec, outputTokens: row.outputTokens, wallClockMs: row.wallClockMs, verdict: row.verdict.graded ? (row.verdict.pass ? 'pass' : `FAIL (${row.verdict.why})`) : 'ungraded', writes: row.writes, artifact: row.artifact, preview: row.preview })
+      bucket.done += row.status === 'done' ? 1 : 0
+      bucket.failed += row.status === 'failed' ? 1 : 0
+      bucket.outputTokens += row.outputTokens ?? 0
+      bucket.busyMs += row.wallClockMs ?? 0
+      if (row.verdict.graded) {
+        bucket.graded += 1
+        if (row.verdict.pass) bucket.verdicts += 1
+      }
+      byEngine.set(row.engine, bucket)
+    }
+    const perEngine = [...byEngine.values()].sort((a, b) => b.busyMs - a.busyMs)
+    const idle = perEngine.length > 1 ? Math.round(perEngine[0].busyMs - Math.min(...perEngine.map((e) => e.busyMs))) : 0
+    return {
+      wallClockMs,
+      perEngine,
+      totals: {
+        chunks: all.length,
+        done: all.filter((r) => r.status === 'done').length,
+        failed: all.filter((r) => r.status === 'failed').length,
+        graded: all.filter((r) => r.verdict.graded).length,
+        gradedPass: all.filter((r) => r.verdict.graded && r.verdict.pass).length,
+        outputTokens: all.reduce((sum, r) => sum + (r.outputTokens ?? 0), 0),
+        estimatedFleetMs: estimate.fleetMs,
+        estimatedSoloMs: estimate.soloMs,
+        estimatedSpeedup: estimate.speedup,
+        busiestMinusQuietestMs: idle,
+      },
+    }
+  }
+
+  function summaryMarkdown(record) {
+    const s = record.summary
+    const mins = (ms) => `${(Math.max(0, Number(ms) || 0) / 1000).toFixed(1)}s`
+    const lines = [
+      `# Fleet run ${record.runId}`,
+      `Task: ${record.title}${record.taskClass ? ` · class: ${record.taskClass}` : ''}`,
+      `Wall clock ${mins(s.wallClockMs)} · estimated fleet ${mins(record.estimate?.fleetMs)} vs solo ${mins(record.estimate?.soloMs)} (×${record.estimate?.speedup ?? '?'}) · gate: ${record.gate?.answer}${record.gate?.note ? ` (${record.gate.note})` : ''}`,
+      '',
+      '## What each computer did',
+      '',
+      '| engine | host | model | chunks | done/failed | busy | tok/s | graded pass | tokens out |',
+      '| --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+    ]
+    for (const e of s.perEngine) {
+      const tps = e.chunks.map((c) => c.tokPerSec).filter((v) => v).map((v) => v.toFixed?.(1) ?? v)
+      lines.push(`| ${e.engine} | ${e.host} | ${e.model} | ${e.chunks.map((c) => `${c.id}${c.role ? ` (${c.role})` : ''}`).join(', ')} | ${e.done}/${e.failed} | ${mins(e.busyMs)} | ${tps.join(', ') || '-'} | ${e.verdicts}/${e.graded} | ${e.outputTokens} |`)
+    }
+    lines.push('')
+    lines.push('## Per chunk')
+    lines.push('')
+    for (const e of s.perEngine) {
+      for (const c of e.chunks) {
+        lines.push(`- **${c.id}** · ${e.engine} (${e.host}) · ${c.role} · ${c.status} · ${c.wallClockMs ?? '?'}ms · ${c.outputTokens ?? '?'} out tokens${c.writes?.length ? ` · writes: ${c.writes.join(', ')}` : ''}`)
+        if (c.title) lines.push(`  - assigned: ${c.title}`)
+        lines.push(`  - check: ${c.verdict}`)
+        if (c.preview) lines.push(`  - said: ${c.preview.slice(0, 200)}`)
+        lines.push(`  - artifact: ${c.artifact}`)
+      }
+    }
+    if (record.warnings?.length) {
+      lines.push('')
+      lines.push('## Warnings')
+      for (const w of record.warnings) lines.push(`- ${w}`)
+    }
+    lines.push('')
+    lines.push(`Merged here by this Host: chunks return artifacts only — no other machine ever touched this working tree.`)
+    return lines.join('\n')
+  }
+
+  async function runs() {
+    if (!existsSync(runsDir)) return { ok: true, runs: [] }
+    const rows = []
+    const names = readdirSync(runsDir)
+    for (const name of names) {
+      const record = load(`${runsDir}/${name}/run.json`, null)
+      if (record) rows.push({ runId: record.runId, title: record.title, taskClass: record.taskClass, startedAt: record.startedAt, wallClockMs: record.wallClockMs, engines: [...new Set((record.chunks ?? []).map((c) => c.engine))], chunks: (record.chunks ?? []).length, done: (record.chunks ?? []).filter((c) => c.status === 'done').length, dir: record.dir })
+    }
+    rows.sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0))
+    return { ok: true, runs: rows.slice(0, 30) }
+  }
+
+  async function runView({ id } = {}) {
+    if (!id) return { ok: false, error: 'run view needs an id' }
+    const record = load(`${runsDir}/${id}/run.json`, null)
+    if (!record) return { ok: false, error: `no run "${id}"` }
+    return { ok: true, run: record, markdown: summaryMarkdown(record) }
+  }
+
+  return { engines, bench, plan, run, runs, runView, estimateSchedule, validate, grade, PROBE_ITEMS }
+}
+
+/* ------------------------------------------------------------------- helpers */
+
+function authorityOfUrl(value) {
+  try {
+    return new URL(String(value)).host
+  } catch {
+    return String(value ?? '')
+  }
+}
+
+function isLocalAuthority(authority) {
+  return /^(127\.0\.0\.1|localhost|::1|\[::1\])(:\d+)?$/u.test(String(authority))
+}
+
+function ageHours(stamps, now) {
+  const newest = Math.max(0, ...stamps.filter((v) => Number.isFinite(v)))
+  if (!newest) return null
+  return round2((now - newest) / 3600000)
+}
+
+function round2(value) {
+  return Math.round(Number(value) * 100) / 100
+}

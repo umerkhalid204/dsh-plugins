@@ -32,11 +32,12 @@
  * the page and the agent cannot drift apart.
  */
 import { spawn } from 'node:child_process'
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { basename, dirname, isAbsolute, join, resolve as resolvePath } from 'node:path'
 import { createHash } from 'node:crypto'
+import { createOrchestrator } from './orchestrate.js'
 
 /**
  * Harness packages are imported when the realm exposes them and stood in for
@@ -190,6 +191,18 @@ function buildConfig(S) {
   })
   const providers = S.array(provider)
   const instances = S.array(instance)
+  // Fractional knobs are integers-by-name (percent) so the schema stays inside
+  // the natural-number DSL the Harness config editor can render and save.
+  const orchestration = S.object({
+    contextFillPercent: S.natural(),
+    minSpeedupPercent: S.natural(),
+    perEngineConcurrency: S.natural(),
+    chunkWallClockMs: S.natural(),
+    chunkOutputTokens: S.natural(),
+    benchTtlHours: S.natural(),
+    fallbackTokPerSec: S.natural(),
+    fallbackContextWindow: S.natural(),
+  })
   // Volatile: a save updates the registry in place instead of remounting the
   // row, so the Hosts this plugin owns are never torn down by an edit.
   providers.meta.volatile = true
@@ -207,6 +220,7 @@ function buildConfig(S) {
     probeTimeoutMs: S.natural(),
     providers,
     instances,
+    orchestration,
   })
 }
 
@@ -1218,6 +1232,22 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  /* ---------- orchestration: the fleet of *engines*, not of DSH hosts ----------
+   *
+   * A chunk is dispatched to an endpoint (any computer: Strata, llama.cpp,
+   * LM Studio, Ollama), so machines that do not run DSH take part on equal
+   * terms. Files never leave this Host: each chunk returns an artifact
+   * (JSON / text / diff) that the agent merges here.
+   */
+  const orchestrator = createOrchestrator({
+    registry,
+    resolveKey,
+    fs: { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync },
+    path: { dirname },
+    paths: { runs: join(paths.root, 'runs'), benchCache: join(paths.root, 'bench.json') },
+    limits: unwrap(config.orchestration) ?? {},
+  })
+
   const operations = {
     async list() {
       return state()
@@ -1482,6 +1512,12 @@ export function apply(ctx, config = {}) {
       ['/fleet/api/logs', 'GET', async (body, req) => operations.logs(parseQuery(req))],
       ['/fleet/api/open', 'POST', (body) => operations.openUrl(body)],
       ['/fleet/api/install-runtime', 'POST', () => operations.installRuntime()],
+      ['/fleet/api/engines', 'GET', async () => orchestrator.engines()],
+      ['/fleet/api/bench', 'POST', (body) => orchestrator.bench(body)],
+      ['/fleet/api/plan', 'POST', (body) => orchestrator.plan(body)],
+      ['/fleet/api/run', 'POST', (body) => orchestrator.run(body)],
+      ['/fleet/api/runs', 'GET', async () => orchestrator.runs()],
+      ['/fleet/api/run-view', 'POST', (body) => orchestrator.runView(body)],
     ]
     for (const [path, method, handler] of routes) {
       ctx.effect(
@@ -1564,6 +1600,18 @@ export function apply(ctx, config = {}) {
         return operations.openUrl(params)
       case 'install-runtime':
         return operations.installRuntime()
+      case 'engines':
+        return orchestrator.engines()
+      case 'bench':
+        return orchestrator.bench(params)
+      case 'plan':
+        return orchestrator.plan(params)
+      case 'run':
+        return orchestrator.run(params)
+      case 'runs':
+        return orchestrator.runs()
+      case 'run-view':
+        return orchestrator.runView(params)
       default:
         return { ok: false, error: `Unknown action "${params.action}".` }
     }
@@ -1578,13 +1626,17 @@ export function apply(ctx, config = {}) {
           + 'list returns the registry plus live status; save replaces {instances} and/or {providers} (omit a key to leave it alone); delete removes one row; '
           + 'action runs provision|start|stop|restart|probe-instance|forget on one instance; logs reads its stdout; probe tests a provider endpoint and returns its models; '
           + 'open-url returns the tokenized URL to open (or opens a Chrome app window when openMode=chrome-app); install-runtime installs the matching `dsh` CLI under the fleet root when the launcher version drifts. '
-          + 'Provider secrets are never written into YAML: a literal apiKey is seeded into the instance `.env` and referenced as apiKeyEnv.',
+          + 'Provider secrets are never written into YAML: a literal apiKey is seeded into the instance `.env` and referenced as apiKeyEnv. '
+          + 'Orchestration (parallel work across computers, including ones without DSH): engines lists every endpoint with its capability fingerprint and measured tok/s; '
+          + 'bench runs task-shaped probes graded locally and caches 24h; plan validates the agent-authored chunk DAG (context fit, disjoint write scopes) and returns the solo-vs-fleet estimate; '
+          + 'run dispatches it — chunks return artifacts only, files never leave this Host — and always answers with the per-computer summary (plus runs/ and ~/.dsh/fleet/runs/<id>/SUMMARY.md). '
+          + 'run refuses unless gate is {asked:true, answer:"split"}: ask the human with the plan estimate first.',
         parameters: {
           type: 'object',
           properties: {
             action: {
               type: 'string',
-              enum: ['list', 'save', 'delete', 'action', 'logs', 'probe', 'open-url', 'install-runtime'],
+              enum: ['list', 'save', 'delete', 'action', 'logs', 'probe', 'open-url', 'install-runtime', 'engines', 'bench', 'plan', 'run', 'runs', 'run-view'],
             },
             id: { type: 'string', description: 'instance id (slug) for action, logs, open-url; row id for delete' },
             op: { type: 'string', enum: ['provision', 'start', 'stop', 'restart', 'probe-instance', 'forget'], description: 'for action=action' },
@@ -1596,6 +1648,13 @@ export function apply(ctx, config = {}) {
             apiKeyRef: { type: 'string', description: 'for probe: credential/environment reference to read' },
             vendor: { type: 'string', description: 'for probe: ollama | lmstudio | openai hints the listing dialect' },
             limit: { type: 'number', description: 'for logs: lines from the end' },
+            chunks: { type: 'array', items: { type: 'object' }, description: 'for plan/run: the chunk list the agent authored — {id, engine, model, role, title, prompt | messages, writes?, expects?, maxTokens?, effort?, wallClockMs?}' },
+            gate: { type: 'object', description: 'required for run: {asked:true, answer:"split"} — the split is opt-in, so the human must be asked first (plan returns the numbers to ask with)' },
+            taskClass: { type: 'string', description: 'for plan/run: review | code | refactor | writing | research | tests | brainstorm' },
+            title: { type: 'string', description: 'for run: human label of this fleet run' },
+            items: { type: 'array', items: { type: 'object' }, description: 'for bench: probe items {kind, messages, expects:{kind,keys|values|pattern}}; omitted uses the built-in constraint/coverage/grounding trio' },
+            engine: { type: 'string', description: 'for bench: limit to one engine name' },
+            rebench: { type: 'boolean', description: 'for bench: ignore the 24h cache' },
           },
           required: ['action'],
           additionalProperties: false,

@@ -1,8 +1,8 @@
 {
   "name": "dsh-plugin-fleet",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "private": true,
-  "description": "DeepSeek Harness plugin: run and switch between several concurrent DSH hosts, each with its own DSH home, port and default LLM provider, so one machine drives several LLM boxes at once.",
+  "description": "DeepSeek Harness plugin: run several concurrent DSH hosts (each with its own DSH home, port and default LLM provider), and fan a task out across every LLM engine on the LAN — including machines that do not run DSH.",
   "type": "module",
   "license": "MIT",
   "author": "umerkhalid204",
@@ -16,18 +16,22 @@
     "instances",
     "multi-instance",
     "llm-provider",
-    "fleet"
+    "fleet",
+    "orchestration",
+    "parallel"
   ],
   "main": "./index.js",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
+    "./orchestrate": "./orchestrate.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg",
     "./package.json": "./package.json"
   },
   "files": [
     "index.js",
+    "orchestrate.js",
     "client.js",
     "cordis.patch.yml",
     "locale/*.json",
