@@ -1787,8 +1787,9 @@ export function apply(ctx, config = {}) {
   const commands = ctx.get?.('commands')
   if (commands?.register) {
     ctx.effect(
-      () =>
-        commands.register({
+      () => {
+        try {
+          return commands.register({
           name: 'fleet',
           description: 'Arm the fleet fan-out for this session, or read fleet status without a model turn.',
           input: { hint: 'status | engines | bench | solo' },
@@ -1820,7 +1821,12 @@ export function apply(ctx, config = {}) {
               text: `Fleet armed for this session (${ttl} min). Send the task: the agent must plan, show the solo-vs-fleet estimate, and get your Split/Solo answer before dispatching. /fleet status lists engines and measurement age; /fleet solo disarms it.`,
             }
           },
-        }),
+        })
+        } catch (error) {
+          console.warn(`dsh-fleet: could not register the /fleet command: ${error?.message ?? error}`)
+          return () => {}
+        }
+      },
       'dsh-fleet /fleet command',
     )
   }
