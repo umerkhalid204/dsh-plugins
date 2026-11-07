@@ -180,3 +180,46 @@ provider's list comes back as a warning rather than a silent break.
 
 `providers` and `instances` are declared volatile, so saving the registry updates them in
 place instead of remounting the plugin — a save can never tear down the Hosts it manages.
+
+## Orchestration: splitting one task across several computers
+
+A computer does not need to run DSH to take part. What gets scheduled is an **engine** — any
+OpenAI-compatible endpoint (Strata, llama.cpp, LM Studio, Ollama, vLLM). Files never leave
+this Host: a chunk returns an artifact (JSON / text / diff) that the agent merges here.
+
+Division of labour, deliberately: the **agent** writes the chunk DAG (what a chunk *means*);
+this plugin does the logistics (validation, measurement, scheduling, the gate, the fan-out,
+the per-computer report).
+
+```yaml
+orchestration:
+  keywords: ["@fleet", "/fleet"]   # the switch; typed by you, verified by the Host
+  requireTrigger: true              # false restores "the agent decides" behaviour
+  triggerTtlMs: 900000              # a keyword arms the split for 15 minutes
+  minSpeedupPercent: 140            # below this, the honest answer is Solo
+  contextFillPercent: 60            # a chunk's brief must fit under this share of the window
+  benchTtlHours: 720                # 30 days: benching is setup, not a per-task ritual
+  autoBench: true                   # measure only engines a plan names that have no fresh row
+  benchConcurrency: 3               # engines probed in parallel; a box is always one queue
+  chunkWallClockMs: 180000
+  chunkOutputTokens: 1800
+  excludeSelfEngine: true           # the box running this agent is not a worker
+  selfContentionPercent: 60         # only used if you opt the local engine back in
+```
+
+**The switch is yours, not the model's.** `run()` refuses to dispatch unless this Host
+observed one of `keywords` in a real message of the calling session — the plugin listens to
+the session log (`session/event`, `user/message`) and records the keyword with a timestamp.
+Typing `/fleet` in the composer is a genuine command: it arms the split for that session and
+prints engine status without spending a model turn. `/fleet status`, `/fleet bench`,
+`/fleet solo` (disarm). Without a keyword, the task runs on one computer.
+
+**Benching is a one-time job.** Each `(engine, model)` row is measured once and stays valid
+for `benchTtlHours`; every run writes its own measured `tok/s` back into `~/.dsh/fleet/bench.json`,
+so the fleet learns its boxes from real work. `fleet action=bench` (or `/fleet bench`) is the
+manual override, and `rebench: true` forces a fresh probe.
+
+**Refusing to split is a first-class outcome.** `plan` reports `soloMs`, `fleetMs`,
+`speedup` and `recommendSplit`; if the critical path is a box four times slower than the
+fastest, the card says Solo. Measured on this fleet: three identical review chunks took
+25.8 s all on the RTX 3090 and 46.3 s spread over three boxes — the slow box set the makespan.

@@ -25,7 +25,23 @@ const DEFAULTS = {
   perEngineConcurrency: 1,
   chunkWallClockMs: 240000,
   chunkOutputTokens: 800,
-  benchTtlHours: 24,
+  /* Measuring an engine is setup, not a per-task ritual. A row stays valid for
+   * 30 days, and every run writes its own measured tok/s back into the cache, so
+   * the fleet knows its boxes after the first contact and never re-benches for
+   * no reason. `rebench: true` is the manual override. */
+  benchTtlHours: 720,
+  /* Auto-bench fills only rows that have no measurement at all, and only for
+   * the engines a plan actually names — never "every computer, every time". */
+  autoBench: true,
+  benchConcurrency: 3,
+  // The machine this Host runs on is also the machine doing the agent's own
+  // inference. Chunks there compete with thinking, so they are excluded from
+  // fan-out unless the user explicitly opts in.
+  excludeSelfEngine: true,
+  keywords: ['@fleet', '/fleet'],
+  // A trigger stops counting after this much time, so a keyword typed hours ago
+  // cannot arm a fan-out that was never meant for this task.
+  triggerTtlMs: 900000,
 }
 
 /* --------------------------------------------------------------- estimation */
@@ -82,7 +98,7 @@ function grade(text, expects) {
 /* ------------------------------------------------------------ the orchestrator */
 
 export function createOrchestrator(deps) {
-  const { registry, resolveKey, paths, limits = {}, now = () => Date.now() } = deps
+  const { registry, resolveKey, paths, limits = {}, now = () => Date.now(), triggers = () => [] } = deps
   const runsDir = paths.runs
   const cachePath = paths.benchCache
   const opt = {
@@ -133,9 +149,9 @@ export function createOrchestrator(deps) {
   }
 
   /** Capability fingerprint for every engine, merged with any measured numbers. */
-  async function engines() {
+  async function engines(sessionId = null) {
     const cache = benchCache()
-    const self = hostRoute()
+    const self = selfRoute(sessionId)
     const rows = []
     for (const provider of providersByName().values()) {
       const key = await keyFor(provider)
@@ -162,9 +178,17 @@ export function createOrchestrator(deps) {
         })
       }
     }
+    // Bench once, not every task. An engine needs a probe only if it has never
+    // been measured or the measurement is older than benchTtlHours.
+    const needsBench = rows
+      .filter((row) => row.hasKey && (!row.measured || ageHours([row.measured.at], now()) > opt.benchTtlHours))
+      .map((row) => `${row.engine}/${row.model}`)
+
     return {
       ok: true,
       engines: rows,
+      needsBench,
+      benchIsFresh: needsBench.length === 0,
       self: self?.found ? { provider: self.provider, model: self.model, host: self.authority, note: self.note } : null,
       selfProbe: self?.found ? undefined : { error: 'no agent-default-model entry readable from the profile patch', tried: self?.tried },
       cacheAgeHours: ageHours(rows.filter((r) => r.measured).map((r) => r.measured.at), now()),
@@ -303,6 +327,21 @@ export function createOrchestrator(deps) {
     return { found: false, tried }
   }
 
+  /* The profile patch names a *default* model; a session can be switched to
+   * another engine in the composer. The live selection is stronger evidence
+   * than the default, and "the box this agent is thinking on" must mean the
+   * one it is actually thinking on — otherwise the self-exclusion guard
+   * protects the wrong machine. */
+  function selfRoute(sessionId) {
+    const hint = deps.selfHint?.(sessionId)
+    if (hint?.model) {
+      const index = providersByName()
+      const provider = (hint.provider ? index.get(hint.provider) : null) ?? [...index.values()].find((p) => (p.models ?? []).some((model) => model.id === hint.model))
+      if (provider) return { found: true, provider: provider.name, model: hint.model, authority: authorityOfUrl(provider.baseURL), source: 'live model selection for this session' }
+    }
+    return hostRoute()
+  }
+
   /* --------------------------------------------------------------- capability */
 
   const PROBE_ITEMS = [
@@ -333,23 +372,24 @@ export function createOrchestrator(deps) {
     },
   ]
 
-  async function bench({ items, engine, rebench = false, concurrency = 1 } = {}) {
+  async function bench({ items, engine, rebench = false, concurrency } = {}) {
     const probeItems = Array.isArray(items) && items.length ? items : PROBE_ITEMS
     const cache = benchCache()
-    const fresh = rebench || ageHours([cache.at], now()) > opt.benchTtlHours
     const index = providersByName()
-    const wanted = [...index.values()].filter((p) => (engine ? p.name === engine : true))
-    if (!wanted.length) return { ok: false, error: engine ? `no engine "${engine}" in the registry` : 'the registry has no providers to bench' }
-    const results = []
-    for (const provider of wanted) {
+    // `engine` accepts one name or an array; omission means every registry row.
+    const wantedNames = Array.isArray(engine) ? engine : (typeof engine === 'string' ? [engine] : null)
+    const wanted = wantedNames ? [...index.values()].filter((p) => wantedNames.includes(p.name)) : [...index.values()]
+    if (!wanted.length) return { ok: false, error: wantedNames ? `none of ${wantedNames.join(', ')} is in the fleet registry` : 'the registry has no providers to bench' }
+    const limit = Math.max(1, Math.min(concurrency ?? opt.benchConcurrency, 4))
+    // Freshness belongs to one (engine, model) row, not to the whole cache: benching
+    // one box never invalidates another box's measurement.
+    const rowStale = (key) => rebench || ageHours([cache.rows[key]?.at], now()) > opt.benchTtlHours
+
+    async function benchProvider(provider) {
       const models = provider.models ?? []
-      if (!models.length) {
-        results.push({ engine: provider.name, skipped: 'no models declared' })
-        continue
-      }
-      if (!fresh && cache.rows[`${provider.name}::${models[0].id}`]?.scores) {
-        results.push({ engine: provider.name, model: models[0].id, cached: true, ...cache.rows[`${provider.name}::${models[0].id}`] })
-        continue
+      if (!models.length) return { engine: provider.name, skipped: 'no models declared' }
+      if (!rowStale(`${provider.name}::${models[0].id}`)) {
+        return { engine: provider.name, model: models[0].id, cached: true, ...cache.rows[`${provider.name}::${models[0].id}`] }
       }
       const perModel = []
       for (const model of models.slice(0, 2)) {
@@ -380,18 +420,22 @@ export function createOrchestrator(deps) {
         // bottlenecks: a box that eats a 20k-token brief at 200 tok/s is a
         // different proposition from one that generates at 90 tok/s. Two calls
         // with the same instruction and different input sizes give the delta.
+        /* Prefill and decode are different bottlenecks, so two calls with the
+         * same instruction and different input sizes give the delta. The filler
+         * is deliberately small (~350 tokens): a 3,600-token filler cost a
+         * 35 tok/s box ~100 s for a number that 150 tokens already measures. */
         const instruction = 'List exactly five numbered items, one word each, about parallel computing.'
         const short = await chat({ provider, model, messages: [{ role: 'user', content: instruction }], maxTokens: 200, temperature: 0, timeoutMs: 120000 })
         const long = await chat({
           provider,
           model,
-          messages: [{ role: 'user', content: 'Filler to force prefill: ' + 'the quick brown fox jumps over the lazy dog. '.repeat(400) + '\n' + instruction }],
+          messages: [{ role: 'user', content: 'Filler to force prefill: ' + 'the quick brown fox jumps over the lazy dog. '.repeat(150) + '\n' + instruction }],
           maxTokens: 200,
           temperature: 0,
-          timeoutMs: 240000,
+          timeoutMs: 180000,
         })
         let throughput = { ok: false }
-        if (short.ok && long.ok && long.promptTokens > short.promptTokens && long.elapsedMs > short.elapsedMs) {
+        if (short.ok && long.ok && long.promptTokens - short.promptTokens >= 100 && long.elapsedMs > short.elapsedMs) {
           const prefill = round2((long.promptTokens - short.promptTokens) / ((long.elapsedMs - short.elapsedMs) / 1000))
           const decodeMs = short.elapsedMs - (short.promptTokens / prefill) * 1000
           throughput = {
@@ -419,11 +463,25 @@ export function createOrchestrator(deps) {
         perModel.push(row)
         cache.rows[`${provider.name}::${model.id}`] = row
       }
-      results.push(...perModel)
+      return perModel
+    }
+
+    /* Engines are measured in parallel: each box has its own GPU, so one slow
+     * box no longer makes the whole bench a serial queue. A box is still one
+     * queue internally — concurrency *inside* a box is what makes it slower. */
+    const results = []
+    for (let i = 0; i < wanted.length; i += limit) {
+      const batch = await Promise.all(wanted.slice(i, i + limit).map(benchProvider))
+      for (const row of batch) results.push(...(Array.isArray(row) ? row : [row]))
     }
     cache.at = now()
     save(cachePath, cache)
-    return { ok: true, bench: results, note: 'Graded locally (parse/contains), never by a model. tok/s decides chunk size; scores decide role.' }
+    return {
+      ok: true,
+      bench: results,
+      cached: results.filter((row) => row.cached).length,
+      note: `Graded locally (parse/contains), never by a model. A row stays valid ${opt.benchTtlHours}h (30 days); only unmeasured or stale rows are re-probed, and every run writes its own measured tok/s back into this cache. tok/s decides chunk size; scores decide role.`,
+    }
   }
 
   /* ------------------------------------------------------------------ plan / gate */
@@ -433,8 +491,9 @@ export function createOrchestrator(deps) {
     return ranked[0] ?? rows[0] ?? null
   }
 
-  function validate(chunks) {
+  function validate(chunks, sessionId = null) {
     const index = providersByName()
+    const self = selfRoute(sessionId)
     const errors = []
     const warnings = []
     const seen = new Set()
@@ -447,6 +506,10 @@ export function createOrchestrator(deps) {
       const provider = index.get(chunk?.engine)
       if (!provider) {
         errors.push(`chunk "${chunk.id}" names engine "${chunk?.engine}", which the registry does not define`)
+        continue
+      }
+      if (opt.excludeSelfEngine && self?.authority && authorityMatch(self.authority, authorityOfUrl(provider.baseURL))) {
+        errors.push(`chunk "${chunk.id}" is assigned to "${provider.name}", the engine this Host is already thinking on. Set orchestration.excludeSelfEngine: false to allow it, or move the chunk to another box.`)
         continue
       }
       const model = modelOf(provider, chunk?.model ?? provider.models?.[0]?.id)
@@ -474,10 +537,10 @@ export function createOrchestrator(deps) {
     return stamp.prefillTokPerSec ?? (stamp.tokPerSec ?? opt.fallbackTokPerSec) * 0.35
   }
 
-  function estimateSchedule(chunks) {
+  function estimateSchedule(chunks, sessionId = null) {
     const rows = []
     const index = providersByName()
-    const self = hostRoute()
+    const self = selfRoute(sessionId)
     for (const chunk of chunks) {
       const provider = index.get(chunk.engine)
       const model = modelOf(provider, chunk.model ?? provider?.models?.[0]?.id)
@@ -532,15 +595,19 @@ export function createOrchestrator(deps) {
    *              makespan. This is what "all my computers work" means.
    * Both numbers are returned so the gate can show the cost of utilisation.
    */
-  function rebalance(chunks, taskClass, mode = 'spread') {
+  function rebalance(chunks, taskClass, mode = 'spread', sessionId = null) {
     const index = providersByName()
+    const self = selfRoute(sessionId)
+    const isSelf = (name) => opt.excludeSelfEngine && self?.authority && authorityMatch(self.authority, authorityOfUrl(index.get(name)?.baseURL ?? ''))
     const workOf = (chunk) => {
       const messages = Array.isArray(chunk.messages) ? chunk.messages : [{ role: 'user', content: chunk.prompt }]
       return { input: estimateMessages(messages), output: Number(chunk.maxTokens) || opt.chunkOutputTokens }
     }
     const priced = chunks.map((chunk) => {
       const { input, output } = workOf(chunk)
-      const options = [...index.keys()].map((name) => {
+      const options = [...index.keys()]
+        .filter((name) => !isSelf(name))
+        .map((name) => {
         const provider = index.get(name)
         const model = provider.models?.[0]
         const stamp = benchCache().rows[`${name}::${model?.id}`]
@@ -596,41 +663,76 @@ export function createOrchestrator(deps) {
     }
   }
 
-  async function plan({ chunks, taskClass, balance = true } = {}) {
+  /* Bench on demand, once. `autoBench` touches only the engines a plan actually
+   * names, and bench() skips every row that still has a fresh measurement, so
+   * this is a first-contact cost rather than a ritual before every task. */
+  async function ensureMeasured(chunks) {
+    if (!opt.autoBench) return { ran: false, engines: [] }
+    const index = providersByName()
+    const names = [...new Set(chunks.map((chunk) => chunk.engine).filter((name) => index.has(name)))]
+    if (!names.length) return { ran: false, engines: [] }
+    const result = await bench({ engine: names })
+    return { ran: true, engines: names, probed: (result.bench ?? []).filter((row) => !row.cached).length, cached: (result.bench ?? []).filter((row) => row.cached).length }
+  }
+
+  async function plan({ chunks, taskClass, balance = true, sessionId = null } = {}) {
     if (!Array.isArray(chunks) || !chunks.length) return { ok: false, error: 'plan needs a chunks array' }
-    const { errors, warnings } = validate(chunks)
-    const estimate = estimateSchedule(chunks)
-    const fingerprint = await engines()
+    const measured = await ensureMeasured(chunks)
+    const { errors, warnings } = validate(chunks, sessionId)
+    const estimate = estimateSchedule(chunks, sessionId)
+    const fingerprint = await engines(sessionId)
     return {
       ok: errors.length === 0,
       taskClass: taskClass ?? null,
       errors,
       warnings,
       estimate,
-      balance: balance ? rebalance(chunks, taskClass) : null,
+      balance: balance ? rebalance(chunks, taskClass, 'spread', sessionId) : null,
       self: fingerprint.self,
+      autoBench: measured,
+      needsBench: fingerprint.needsBench,
       engines: fingerprint.engines.filter((row) => row.hasKey),
-      gateRule: `Split is offered when speedup ≥ ${opt.minSpeedup ?? 1.4}; below that the honest answer is Solo.`,
-      askUser: errors.length === 0 ? 'Present this estimate to the user and ask: Split / Solo / Adjust. Then call run with gate {asked:true, answer:"split"} only if they chose Split.' : 'Fix the errors, then plan again.',
+      gateRule: `Split is offered when speedup ≥ ${opt.minSpeedup ?? 1.4}; below that the honest answer is Solo. Fan-out is dispatched only when this Host itself observed ${opt.keywords.join(' or ')} in a message of the calling session (requireTrigger: false turns that guard off).`,
+      askUser: errors.length === 0
+        ? (fingerprint.needsBench.length
+          ? `These engines have no fresh measurement: ${fingerprint.needsBench.join(', ')}. Bench them once (or let autoBench do it on the next plan), then ask the user Split / Solo.`
+          : 'Present this estimate to the user and ask: Split / Solo / Adjust. Only if they answer Split, call run with gate {asked:true, answer:"split"}. The @fleet trigger is checked by this Host, not by you — do not invent it.')
+        : 'Fix the errors, then plan again.',
     }
   }
 
   /* --------------------------------------------------------------------- the run */
 
-  async function run({ chunks, title = 'fleet run', taskClass = null, gate, budget } = {}) {
+  async function run({ chunks, title = 'fleet run', taskClass = null, gate, budget, sessionId } = {}) {
     if (!Array.isArray(chunks) || !chunks.length) return { ok: false, error: 'run needs a chunks array' }
     // Requirement: the split is optional and must pause for the human. Enforced
     // here, in the API, so no agent turn can skip the prompt.
     if (!gate || gate.asked !== true || gate.answer !== 'split') {
       return {
         ok: false,
-        error: 'Refusing to dispatch: the fleet split is opt-in. Call plan first, then ask the user (Split / Solo / Adjust), then re-call run with gate: {asked:true, answer:"split", askedAt, note}.',
+        error: 'Refusing to dispatch: the fleet split is opt-in. Call plan first, then ask the user (Split / Solo / Adjust), then re-call run with gate: {asked:true, answer:"split", note}.',
         gate: gate ?? null,
       }
     }
-    const { errors, warnings } = validate(chunks)
+    /* Manual control, verified by the Host. The trigger registry is filled by a
+     * listener on the session log: this process watched the message that armed
+     * it. The agent's `gate.trigger` string is no longer the authority, so a
+     * task without @fleet / /fleet cannot be fanned out by a helpful mistake.
+     * `orchestration.requireTrigger: false` restores the old behaviour. */
+    const live = triggers(sessionId)
+    if (opt.requireTrigger !== false && !live.length) {
+      return {
+        ok: false,
+        error: `Refusing to dispatch: this Host never saw ${opt.keywords.join(' or ')} in a message from ${sessionId ? `session ${sessionId}` : 'any session'} within the last ${Math.round(opt.triggerTtlMs / 60000)} minutes. Without that keyword the task runs on one computer; write it in the request if you want the fleet.`,
+        keywords: opt.keywords,
+        triggerTtlMs: opt.triggerTtlMs,
+        requireTrigger: opt.requireTrigger !== false,
+      }
+    }
+    const { errors, warnings } = validate(chunks, sessionId)
     if (errors.length) return { ok: false, error: 'plan did not validate', errors, warnings }
-    const estimate = estimateSchedule(chunks)
+    const measured = await ensureMeasured(chunks)
+    const estimate = estimateSchedule(chunks, sessionId)
     const runId = `${now()}-${String(title).toLowerCase().replace(/[^a-z0-9]+/gu, '-').slice(0, 40)}`
     const dir = `${runsDir}/${runId}`
     ensureDir(`${dir}/chunks`)
@@ -676,7 +778,7 @@ export function createOrchestrator(deps) {
     }
 
     const started = now()
-    const record = { runId, title, taskClass, dir, startedAt: started, gate, warnings, estimate, engineConcurrency: opt.perEngineConcurrency, chunks: [] }
+    const record = { runId, title, taskClass, dir, startedAt: started, gate, trigger: live[0] ?? null, autoBench: measured, warnings, estimate, engineConcurrency: opt.perEngineConcurrency, chunks: [] }
     save(`${dir}/run.json`, record)
 
     const perEngine = await Promise.all(
@@ -786,7 +888,7 @@ export function createOrchestrator(deps) {
     const lines = [
       `# Fleet run ${record.runId}`,
       `Task: ${record.title}${record.taskClass ? ` · class: ${record.taskClass}` : ''}`,
-      `Wall clock ${mins(s.wallClockMs)} · estimated fleet ${mins(record.estimate?.fleetMs)} vs solo ${mins(record.estimate?.soloMs)} (×${record.estimate?.speedup ?? '?'}) · gate: ${record.gate?.answer}${record.gate?.note ? ` (${record.gate.note})` : ''}`,
+      `Wall clock ${mins(s.wallClockMs)} · estimated fleet ${mins(record.estimate?.fleetMs)} vs solo ${mins(record.estimate?.soloMs)} (×${record.estimate?.speedup ?? '?'}) · gate: ${record.gate?.answer}${record.gate?.note ? ` (${record.gate.note})` : ''} · armed by ${record.trigger?.keyword ?? 'no keyword'}`,
       '',
       '## What each computer did',
       '',
@@ -838,7 +940,7 @@ export function createOrchestrator(deps) {
     return { ok: true, run: record, markdown: summaryMarkdown(record) }
   }
 
-  return { engines, bench, plan, run, runs, runView, estimateSchedule, rebalance, validate, grade, hostRoute, PROBE_ITEMS }
+  return { engines, bench, plan, run, runs, runView, estimateSchedule, rebalance, validate, grade, hostRoute, selfRoute, PROBE_ITEMS }
 }
 
 /* ------------------------------------------------------------------- helpers */

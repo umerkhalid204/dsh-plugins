@@ -205,6 +205,18 @@ function buildConfig(S) {
     // Only set this if you want the planner to price contention on the box that
     // also runs this agent (e.g. 70 = assume 70% of its measured speed).
     selfContentionPercent: S.natural(),
+    // The machine hosting this Host is the one the agent thinks on. Keep it out
+    // of fan-out so chunks never compete with the agent's own inference.
+    excludeSelfEngine: S.boolean(),
+    // Fan-out happens only when the user types one of these in the request.
+    keywords: S.array(S.string()),
+    requireTrigger: S.boolean(),
+    // How long a keyword keeps arming the split (default 15 minutes).
+    triggerTtlMs: S.natural(),
+    // Measure an engine once, when a plan names it and it has no fresh row.
+    autoBench: S.boolean(),
+    // Engines probed in parallel (each has its own GPU); never > 4.
+    benchConcurrency: S.natural(),
   })
   // Volatile: a save updates the registry in place instead of remounting the
   // row, so the Hosts this plugin owns are never torn down by an edit.
@@ -1242,6 +1254,59 @@ export function apply(ctx, config = {}) {
    * terms. Files never leave this Host: each chunk returns an artifact
    * (JSON / text / diff) that the agent merges here.
    */
+  /* --------------------------- the split switch: armed by the user, not by the model
+   *
+   * `run()` fans out only when this Host itself saw a fleet keyword in a real
+   * message. The listener reads the durable session log as events commit, so
+   * the evidence is the human's own text — nothing a model invents can arm it,
+   * and a request without the keyword stays on one computer. Entries expire
+   * after `orchestration.triggerTtlMs` so yesterday's `@fleet` cannot dispatch
+   * today's task.
+   */
+  const fleetKeywords = ((unwrap(config.orchestration)?.keywords) ?? ['@fleet', '/fleet']).map((keyword) => String(keyword).toLowerCase())
+  const armed = new Map() // sessionId -> { keyword, at, seq, excerpt }
+  const liveModel = new Map() // sessionId -> { provider, model, at } — the engine this session actually thinks on
+
+  function messageText(content) {
+    if (typeof content === 'string') return content
+    if (Array.isArray(content)) return content.map((block) => (typeof block === 'string' ? block : block?.text ?? '')).join(' ')
+    return ''
+  }
+
+  function recordTrigger(sessionId, keyword, excerpt, seq) {
+    armed.set(sessionId, { keyword, at: Date.now(), seq: seq ?? null, excerpt: messageText(excerpt).slice(0, 160) })
+    if (armed.size > 60) {
+      for (const [id] of [...armed.entries()].sort((a, b) => a[1].at - b[1].at).slice(0, armed.size - 60)) armed.delete(id)
+    }
+  }
+
+  function liveTriggers(sessionId) {
+    const ttl = Number(unwrap(config.orchestration)?.triggerTtlMs) || 900000
+    const cutoff = Date.now() - ttl
+    const rows = [...armed.entries()].filter(([, row]) => row.at >= cutoff).map(([session, row]) => ({ session, ...row }))
+    if (!sessionId) return rows
+    return rows.filter((row) => row.session === String(sessionId))
+  }
+
+  if (typeof ctx.on === 'function') {
+    ctx.on('session/event', (session, event) => {
+      const id = String(session?.id ?? '')
+      // Which engine this session is actually thinking on. The profile patch only
+      // names a *default*; the composer can switch a session to another box, and
+      // the self-exclusion guard must know the live one.
+      if (event?.type === 'model/selection' || event?.type === 'request/header') {
+        const selection = event?.type === 'model/selection' ? event?.data : event?.data?.header?.config
+        if (selection?.provider || selection?.model) liveModel.set(id, { provider: selection.provider ?? null, model: selection.model ?? null, at: Date.now() })
+        return
+      }
+      if (event?.type !== 'user/message') return
+      const text = messageText(event?.data?.content).toLowerCase()
+      const keyword = fleetKeywords.find((needle) => text.includes(needle))
+      if (!keyword) return
+      recordTrigger(id, keyword, event?.data?.content, event?.seq)
+    })
+  }
+
   const orchestrator = createOrchestrator({
     registry,
     resolveKey,
@@ -1249,6 +1314,8 @@ export function apply(ctx, config = {}) {
     path: { dirname },
     paths: { runs: join(paths.root, 'runs'), benchCache: join(paths.root, 'bench.json') },
     limits: unwrap(config.orchestration) ?? {},
+    triggers: liveTriggers,
+    selfHint: (sessionId) => liveModel.get(sessionId) ?? null,
   })
 
   const operations = {
@@ -1605,7 +1672,7 @@ export function apply(ctx, config = {}) {
       case 'install-runtime':
         return operations.installRuntime()
       case 'engines':
-        return orchestrator.engines()
+        return orchestrator.engines(params.sessionId)
       case 'bench':
         return orchestrator.bench(params)
       case 'plan':
@@ -1617,7 +1684,9 @@ export function apply(ctx, config = {}) {
       case 'run-view':
         return orchestrator.runView(params)
       case 'balance':
-        return orchestrator.rebalance(params.chunks ?? [], params.taskClass)
+        return orchestrator.rebalance(params.chunks ?? [], params.taskClass, params.mode ?? 'spread', params.sessionId)
+      case 'trigger':
+        return { ok: true, keywords: fleetKeywords, ttlMs: Number(unwrap(config.orchestration)?.triggerTtlMs) || 900000, armed: liveTriggers(params.sessionId) }
       default:
         return { ok: false, error: `Unknown action "${params.action}".` }
     }
@@ -1634,15 +1703,19 @@ export function apply(ctx, config = {}) {
           + 'open-url returns the tokenized URL to open (or opens a Chrome app window when openMode=chrome-app); install-runtime installs the matching `dsh` CLI under the fleet root when the launcher version drifts. '
           + 'Provider secrets are never written into YAML: a literal apiKey is seeded into the instance `.env` and referenced as apiKeyEnv. '
           + 'Orchestration (parallel work across computers, including ones without DSH): engines lists every endpoint with its capability fingerprint and measured tok/s; '
-          + 'bench runs task-shaped probes graded locally and caches 24h; plan validates the agent-authored chunk DAG (context fit, disjoint write scopes) and returns the solo-vs-fleet estimate; '
+          + 'bench runs task-shaped probes graded locally and caches each (engine, model) row for orchestration.benchTtlHours (default 720h = 30 days); '
+          + 'plan validates the agent-authored chunk DAG (context fit, disjoint write scopes) and returns the solo-vs-fleet estimate; '
           + 'run dispatches it — chunks return artifacts only, files never leave this Host — and always answers with the per-computer summary (plus runs/ and ~/.dsh/fleet/runs/<id>/SUMMARY.md). '
-          + 'run refuses unless gate is {asked:true, answer:"split"}: ask the human with the plan estimate first.',
+          + 'Fan-out is opt-in twice: run refuses unless gate is {asked:true, answer:"split"} AND this Host observed one of orchestration.keywords (@fleet, /fleet) in a message of the calling session within triggerTtlMs. '
+          + 'The keyword is checked here, not by the agent: without it the task stays on one computer. action=trigger reports what was observed. '
+          + 'Benching is a one-time job, not a per-task ritual — autoBench (default on) measures only engines a plan names that have no fresh row, and every run writes its own measured tok/s back into the cache. '
+          + 'The engine this Host runs on is excluded from chunks by default (orchestration.excludeSelfEngine: true) so fan-out never competes with the agent\u2019s own inference.',
         parameters: {
           type: 'object',
           properties: {
             action: {
               type: 'string',
-              enum: ['list', 'save', 'delete', 'action', 'logs', 'probe', 'open-url', 'install-runtime', 'engines', 'bench', 'plan', 'balance', 'run', 'runs', 'run-view'],
+              enum: ['list', 'save', 'delete', 'action', 'logs', 'probe', 'open-url', 'install-runtime', 'engines', 'bench', 'plan', 'balance', 'run', 'runs', 'run-view', 'trigger'],
             },
             id: { type: 'string', description: 'instance id (slug) for action, logs, open-url; row id for delete' },
             op: { type: 'string', enum: ['provision', 'start', 'stop', 'restart', 'probe-instance', 'forget'], description: 'for action=action' },
@@ -1655,7 +1728,7 @@ export function apply(ctx, config = {}) {
             vendor: { type: 'string', description: 'for probe: ollama | lmstudio | openai hints the listing dialect' },
             limit: { type: 'number', description: 'for logs: lines from the end' },
             chunks: { type: 'array', items: { type: 'object' }, description: 'for plan/run: the chunk list the agent authored — {id, engine, model, role, title, prompt | messages, writes?, expects?, maxTokens?, effort?, wallClockMs?}' },
-            gate: { type: 'object', description: 'required for run: {asked:true, answer:"split"} — the split is opt-in, so the human must be asked first (plan returns the numbers to ask with)' },
+            gate: { type: 'object', description: 'required for run: {asked:true, answer:"split", trigger:"@fleet"} — the split is opt-in and only happens when the user wrote a fleet keyword; plan returns the numbers to ask with' },
             taskClass: { type: 'string', description: 'for plan/run: review | code | refactor | writing | research | tests | brainstorm' },
             title: { type: 'string', description: 'for run: human label of this fleet run' },
             items: { type: 'array', items: { type: 'object' }, description: 'for bench: probe items {kind, messages, expects:{kind,keys|values|pattern}}; omitted uses the built-in constraint/coverage/grounding trio' },
@@ -1690,10 +1763,14 @@ export function apply(ctx, config = {}) {
             },
           ],
         },
-        isConcurrencySafe: (args) => ['list', 'logs', 'probe'].includes(args?.action),
-        async execute(params) {
+        isConcurrencySafe: (args) => ['list', 'logs', 'probe', 'engines', 'trigger', 'runs'].includes(args?.action),
+        async execute(params, exec) {
+          // The session that issued the call is the session the trigger must
+          // have been seen in — the Host binds it, the model cannot choose it.
+          // (The arguments object is frozen, so bind into a copy.)
+          const call = exec?.agent?.id ? { ...params, sessionId: String(exec.agent.id) } : params
           try {
-            return plain(await dispatch(params))
+            return plain(await dispatch(call))
           } catch (error) {
             return plain({ ok: false, error: String(error?.message ?? error) })
           }
@@ -1701,6 +1778,52 @@ export function apply(ctx, config = {}) {
       }),
     'dsh-fleet tool',
   )
+
+  /* ------------------------------------------------ `/fleet`: the switch, in the composer */
+
+  /* A real slash command, so arming the fan-out is something you do rather than
+   * something you hope the model noticed. The handler runs without a model turn:
+   * it records the trigger for this session and prints the fleet's state. */
+  const commands = ctx.get?.('commands')
+  if (commands?.register) {
+    ctx.effect(
+      () =>
+        commands.register({
+          name: 'fleet',
+          description: 'Arm the fleet fan-out for this session, or read fleet status without a model turn.',
+          input: { hint: 'status | engines | bench | solo' },
+          async handler(invocation) {
+            const sessionId = String(invocation?.agent?.id ?? '')
+            const raw = String(invocation?.rawInput ?? '').trim()
+            const arg = raw.toLowerCase()
+            if (arg === 'solo' || arg === 'off') {
+              armed.delete(sessionId)
+              return { kind: 'success', text: 'Fan-out disarmed for this session: the next task runs on one computer until you write @fleet or /fleet again.' }
+            }
+            recordTrigger(sessionId, '/fleet', raw || '/fleet', null)
+            const ttl = Math.round(((Number(unwrap(config.orchestration)?.triggerTtlMs) || 900000) / 60000))
+            if (arg === 'engines' || arg === 'status') {
+              const fingerprint = await orchestrator.engines()
+              const lines = fingerprint.engines.map((row) => `${row.engine} · ${row.host} · ${row.model} · ${row.measured?.tokPerSec ?? 'unmeasured'} tok/s${row.sharedWithHost ? ' [this machine — excluded from chunks]' : ''}`)
+              return {
+                kind: 'success',
+                text: `Fleet armed for this session (trigger expires in ${ttl} min).\n${lines.join('\n')}\nSelf: ${fingerprint.self ? `${fingerprint.self.provider}/${fingerprint.self.model}` : 'unknown'}\n${fingerprint.needsBench.length ? `Needs bench: ${fingerprint.needsBench.join(', ')}` : 'All measurements fresh.'}`,
+              }
+            }
+            if (arg === 'bench') {
+              const result = await orchestrator.bench({ rebench: raw.includes('rebench') })
+              const lines = (result.bench ?? []).map((row) => `${row.engine} · ${row.model} · ${row.tokPerSec ?? '-'} tok/s${row.cached ? ' (cached, not re-probed)' : ''}`)
+              return { kind: 'success', text: lines.join('\n') || result.error || 'nothing to bench' }
+            }
+            return {
+              kind: 'success',
+              text: `Fleet armed for this session (${ttl} min). Send the task: the agent must plan, show the solo-vs-fleet estimate, and get your Split/Solo answer before dispatching. /fleet status lists engines and measurement age; /fleet solo disarms it.`,
+            }
+          },
+        }),
+      'dsh-fleet /fleet command',
+    )
+  }
 
   /* --------------------------------------------- autostart of pinned hosts */
 
