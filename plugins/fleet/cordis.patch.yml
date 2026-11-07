@@ -1,0 +1,107 @@
+# dsh-plugin-fleet bundle layer: one Host row (registry, provisioning, process
+# lifecycle, endpoint probing, the `/fleet/api/*` routes and the `fleet` tool)
+# plus its Client half (the Fleet page and sidebar row, from ./client.js).
+#
+# The registry below is the STARTER set that every machine gets on install, so
+# that whichever computer you sit at, the other computers already appear as
+# providers. Edit it from the Fleet page (or the `fleet` tool); the plugin then
+# rewrites this row's own config in your profile patch through the Harness
+# config editor — it never touches the rest of your patch file, and your own
+# per-machine registry outranks this starter from then on.
+#
+# Portability rules used here:
+#   • LAN servers are named by machine (`strata-108`, `strata-107`), with the
+#     same endpoint from every box on the network, and `apiKeyRef` so no secret
+#     is stored in the bundle. Store the value once per machine: the Models page
+#     or `~/.dsh/.env`, or let a provisioned member copy the parent store.
+#   • The engine that lives on the machine you are sitting at is `local-lmstudio`
+#     on 127.0.0.1 — identical spelling everywhere, and it only answers where the
+#     server is actually running. Its model list is declared so the picker still
+#     shows real models (with real context windows) while the server is off.
+#   • `instances` are deliberately one local member: each machine owns its own
+#     members (its own DSH homes and ports). Ports are loopback-bound, so the
+#     same numbers on different machines never collide.
+#
+# Row config keys:
+#   root                 where logs/state/generated patches live (default $DSH_HOME/fleet)
+#   homeRoot             parent of each instance's own DSH_HOME
+#   launcher             'auto' finds a `dsh` matching this app's version, or a path
+#   portBase             first port offered when you add an instance
+#   requireVersion       surface launcher/host version drift
+#   requireSameOrigin    true (enforce) | observe (record only) | false
+#   openMode             browser (the page opens it; default) | tab (Host opens a
+#                        tab) | chrome-app (dedicated Chrome window, second
+#                        instance) | none
+#   autostartOnBoot      start instances flagged autostart when this Host boots
+#   providers[]          name, label, api, baseURL, apiKeyRef (or apiKey), models[]
+#   instances[]          id, label, port, home, providers['*'], default, seedEnv,
+#                        autostart, bundles[]
+#
+# Secrets: prefer apiKeyRef. A literal apiKey is written into the instance's own
+# `.env` (mode 600) at provision time and referenced from the generated patch as
+# apiKeyEnv, so no key ever lands in a YAML file.
+
+- insert:
+    - id: fleet
+      name: dsh-plugin-fleet
+      config:
+        homeRoot: '~/.dsh-fleet'
+        portBase: 3101
+        launcher: auto
+        requireVersion: true
+        requireSameOrigin: true
+        openMode: browser
+        autostartOnBoot: false
+        startTimeoutMs: 90000
+        probeTimeoutMs: 5000
+        providers:
+          - name: strata-108
+            label: 'Strata box 192.168.10.108'
+            api: openai-completions
+            baseURL: 'http://192.168.10.108:47832/v1'
+            apiKeyRef: STRATA_API_KEY
+            models:
+              - id: iq3_s
+                name: Qwen3.8-Flash-Next IQ3_S
+                contextWindow: 524288
+                maxTokens: 32768
+                reasoningEfforts:
+                  xhigh: xhigh
+                  low: low
+                  medium: medium
+                  high: high
+          - name: strata-107
+            label: 'Strata box 192.168.10.107'
+            api: openai-completions
+            baseURL: 'http://192.168.10.107:47832/v1'
+            apiKeyRef: STRATA_API_KEY
+            models:
+              - id: iq3_xxs
+                name: Qwen3.8-Flash-Next IQ3_XXS
+                contextWindow: 524288
+                maxTokens: 32768
+          - name: local-lmstudio
+            label: 'LM Studio on this machine (MLX)'
+            api: openai-completions
+            baseURL: 'http://127.0.0.1:1234/v1'
+            models:
+              - id: lmstudio-community/Qwen3.8-27B-MLX-6bit
+                name: Qwen3.8-27B MLX 6-bit
+                contextWindow: 262144
+                input: [text, image]
+              - id: lmstudio-community/orcarouter/Qwen3.8-27B-Uncensored-MLX
+                name: Qwen3.8-27B Uncensored MLX
+                contextWindow: 262144
+              - id: lmstudio-community/orcarouter/Qwen3.8-27B-Uncensored-MLX/2-bit
+                name: Qwen3.8-27B Uncensored MLX 2-bit
+                contextWindow: 262144
+        instances:
+          - id: box-local
+            label: 'This machine (local engine)'
+            port: 3101
+            providers: ['*']
+            seedEnv: true
+            autostart: false
+            default:
+              provider: local-lmstudio
+              model: lmstudio-community/Qwen3.8-27B-MLX-6bit

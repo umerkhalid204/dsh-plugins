@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Fleet",
+    "description": "Run and switch between several DSH hosts at once, each with its own home, port and default LLM provider."
+  }
+}
