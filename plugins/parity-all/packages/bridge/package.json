@@ -1,0 +1,7 @@
+{
+  "name": "dsh-bionic-parity-all-bridge",
+  "version": "1.0.2",
+  "private": true,
+  "description": "Vendored host-only sub-package of dsh-bionic-parity-all (cloud bridge adapter). Own manifest, no dsh.client: keeps host rows under it from counting as extra Loader sources for the umbrella package's single dsh.client row (client-modules allows one active Loader entry per client package).",
+  "type": "module"
+}

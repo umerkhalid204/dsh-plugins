@@ -4,16 +4,16 @@ Open any chat in that computer's DeepSeek Harness (Desktop or Web) and send exac
 
 ```
 Install five bundles with plugin_manager (action install_bundle), one per line, in order, then report each application stage and any warnings:
-1. target: github:umerkhalid204/dsh-plugins#path:plugins/parity-all&v1.1.1
-2. target: github:umerkhalid204/dsh-plugins#path:plugins/local-llm&v1.1.1
-3. target: github:umerkhalid204/dsh-plugins#path:plugins/career-ops&v1.1.1
-4. target: github:umerkhalid204/dsh-plugins#path:plugins/session-delete&v1.1.1
-5. target: github:umerkhalid204/dsh-plugins#path:plugins/fleet&v1.2.0
+1. target: github:umerkhalid204/dsh-plugins#path:plugins/parity-all&v1.3.0
+2. target: github:umerkhalid204/dsh-plugins#path:plugins/local-llm&v1.3.0
+3. target: github:umerkhalid204/dsh-plugins#path:plugins/career-ops&v1.3.0
+4. target: github:umerkhalid204/dsh-plugins#path:plugins/session-delete&v1.3.0
+5. target: github:umerkhalid204/dsh-plugins#path:plugins/fleet&v1.3.0
 ```
 
-Line 1 installs the full Bionic-parity stack (voice, the `openrouter-cloud` route + `openrouter_bridge_status` diagnostics, Computer Use, browser control, skills install + external skill roots, Document preset, Documents page). Line 2 adds the **local-llm** engine layer: LM Studio (MLX), Ollama, Lemonade and generic OpenAI-compatible engines as first-class provider routes with Settings-models cards, endpoint editing, model discovery, catalog enrichment, and the `local_models scan/use/use/ping/settings` tool. Lines 3–4 add career-ops and session-delete. Line 5 adds **fleet**: a profile switcher that runs 4–5 concurrent DSH hosts (each with its own `DSH_HOME`, port and default provider) and opens them from one page. All live in this repo as path fragments.
+Line 1 installs the full Bionic-parity stack (voice, the `openrouter-cloud` route + `openrouter_bridge_status` diagnostics, Computer Use, browser control, skills install + external skill roots, Document preset, Documents page). Line 2 adds the **local-llm** engine layer: LM Studio (MLX), Ollama, Lemonade and generic OpenAI-compatible engines as first-class provider routes with Settings-models cards, endpoint editing, model discovery, catalog enrichment, and the `local_models scan/use/use/ping/settings` tool. Lines 3–4 add career-ops and session-delete. Line 5 adds **fleet**: a profile switcher that runs several concurrent DSH hosts (each with its own `DSH_HOME`, port and default provider) and, on top of that, **orchestration** — one task fanned out across every LLM engine on your network, including boxes that do not run DSH (`@fleet` / `/fleet`, with a Host-verified gate, a one-time bench of each engine and a `plan` that can honestly answer "Solo"). All live in this repo as path fragments.
 
-> `plugins/fleet` is new and **not in any tag yet**: commit it and tag `v1.2.0` before using line 5 from GitHub. Until then install it from a local checkout (`install_bundle` with the absolute `plugins/fleet` directory).
+Tag `v1.3.0` is the current release: fleet **0.1.16**, parity-all 1.0.2 (with its three vendored sub-package manifests now committed — without them the umbrella's host rows do not project), local-llm 0.3.0, career-ops 1.0.4, session-delete 1.0.2.
 
 Requirements: a Harness at 0.2.2-rc.1 (the `@deepseek-ai/*` pins; bump and re-tag when your Harness moves) and network access to GitHub + npm.
 
